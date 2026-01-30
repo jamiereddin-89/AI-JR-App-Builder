@@ -1,45 +1,25 @@
-// main.js — bootstrap for the vanilla app shell
-// Keep this minimal: initializes theme toggles and panel behavior.
-
+// main.js — initializes panels, theme, and the main app module
 import { initPanels } from './panels.js';
-
-// Tiny state utility (centralized state)
-export const state = (function () {
-  let store = {
-    theme: localStorage.getItem('aijr-theme') || 'light',
-  };
-  const subs = new Set();
-  function get() { return { ...store }; }
-  function set(partial) {
-    store = { ...store, ...partial };
-    subs.forEach((cb) => cb(get()));
-    // persist theme automatically
-    if (partial.theme) localStorage.setItem('aijr-theme', partial.theme);
-  }
-  function subscribe(cb) { subs.add(cb); return () => subs.delete(cb); }
-  return { get, set, subscribe };
-})();
+import { initApp } from './app.js';
 
 function applyTheme(theme) {
   document.body.className = `theme-${theme}`;
 }
 
-// Hook up theme buttons
 function initThemeButtons() {
   document.querySelectorAll('[data-theme]').forEach(btn => {
     btn.addEventListener('click', () => {
       const t = btn.getAttribute('data-theme');
-      state.set({ theme: t });
+      localStorage.setItem('aijr-theme', t);
+      applyTheme(t);
     });
   });
 
-  // Apply persisted theme on load
-  applyTheme(state.get().theme);
-  state.subscribe(s => applyTheme(s.theme));
+  const saved = localStorage.getItem('aijr-theme') || 'light';
+  applyTheme(saved);
 }
 
 function initUsageBarDemo() {
-  // Fake usage refresh demo (we'll just animate the fill on boot)
   const fill = document.getElementById('usage-fill');
   if (!fill) return;
   setTimeout(() => {
@@ -49,8 +29,7 @@ function initUsageBarDemo() {
   }, 400);
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  // initialize panels and resizers
+window.addEventListener('DOMContentLoaded', async () => {
   initPanels({
     containerId: 'container',
     leftId: 'left-panel',
@@ -63,12 +42,11 @@ window.addEventListener('DOMContentLoaded', () => {
   initThemeButtons();
   initUsageBarDemo();
 
-  // example: new file button hook (placeholder)
-  const newFileBtn = document.getElementById('new-file-btn');
-  if (newFileBtn) {
-    newFileBtn.addEventListener('click', () => {
-      // In the full migration we'll show a modal and create a new editor tab.
-      alert('New file flow will be added in the next step.');
-    });
-  }
+  // init the app (wires UI, editor, storage, providers)
+  await initApp({
+    leftContentId: 'left-content',
+    editorAreaId: 'editor-area',
+    rightContentId: 'right-content',
+    newFileBtnId: 'new-file-btn',
+  });
 });
