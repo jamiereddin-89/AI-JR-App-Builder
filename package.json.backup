@@ -1,0 +1,25 @@
+### C:\Users\jayre\Music\JR-app\package.json
+```json
+1: {
+2:   "name": "workspace",
+3:   "version": "1.0.0",
+4:   "main": "script.js",
+5:   "scripts": {
+6:     "dev": "vite",
+7:     "build": "vite build",
+8:     "preview": "vite preview"
+9:   },
+10:   "keywords": [],
+11:   "author": "",
+12:   "license": "ISC",
+13:   "description": "",
+14:   "dependencies": {
+15:     "@monaco-editor/react": "^4.7.0",
+16:     "lucide-react": "^0.563.0",
+17:     "react": "^19.2.4",
+18:     "react-dom": "^19.2.4",
+19:     "use-fireproof": "^0.24.9",
+20:     "vite": "^7.3.1"
+21:   }
+22: }
+```
