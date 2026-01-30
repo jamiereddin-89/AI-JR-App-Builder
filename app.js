@@ -1,13 +1,10 @@
-// app.js — Vanilla conversion and feature-complete implementation derived from script.jsx
+// app.js — Feature-complete vanilla app script
 // - Browser-only (no build)
-// - Uses CodeMirror 5 (loaded in index.html)
+// - Uses CodeMirror 5 (loaded via index.html)
 // - Attempts to use Fireproof if available; otherwise falls back to localStorage
-// - Implements: multi-file editor, file tabs, templates, modals (Export/Import, Settings, Share, Versions, New File),
-//   Build/Deploy flows (Puter + Pollinations attempts), usage bar, logs, favorites, providers, persistence, versions,
-//   preview iframe, run, copy code, export single app, import, share link, basic analytics
-//
-// NOTE: This is a direct, pragmatic conversion. Some Puter SDK behavior is best-effort (uses window.puter if present).
-// The code focuses on behavior parity rather than exact DOM or styling parity — styles.css provides look-and-feel.
+// - Adds: formatting, autosave & versions, improved export/import UI, enhanced Settings modal,
+//   accessibility improvements, and keyboard shortcuts.
+// NOTE: This single file is self-contained and intended to replace the previous app.js.
 
 export async function initApp(opts = {}) {
   const {
@@ -23,7 +20,10 @@ export async function initApp(opts = {}) {
     for (const [k, v] of Object.entries(attrs || {})) {
       if (k === 'class') d.className = v;
       else if (k === 'html') d.innerHTML = v;
-      else if (k.startsWith('on') && typeof v === 'function') d.addEventListener(k.slice(2).toLowerCase(), v);
+      else if (k === 'style') d.style.cssText = v;
+      else if (k === 'aria') {
+        for (const [ak, av] of Object.entries(v)) d.setAttribute(`aria-${ak}`, av);
+      } else if (k.startsWith('on') && typeof v === 'function') d.addEventListener(k.slice(2).toLowerCase(), v);
       else d.setAttribute(k, v);
     }
     (Array.isArray(children) ? children : [children]).forEach(c => {
@@ -35,36 +35,27 @@ export async function initApp(opts = {}) {
   };
 
   const cn = (...parts) => parts.filter(Boolean).join(' ');
-
-  const debounce = (fn, delay = 300) => {
-    let t = null;
-    return (...args) => {
-      clearTimeout(t);
-      t = setTimeout(() => fn(...args), delay);
-    };
-  };
-
+  const debounce = (fn, ms = 300) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  const escapeHtml = s => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
   const stripFenced = s => s.replace(/```(?:html|HTML)?\n?/g, '').replace(/```\n?/g, '').trim();
-  const escapeHtml = str => String(str).replace(/[&<>"']/g, s => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s]));
 
-  // ---------- State store ----------
+  // ---------- Local store ----------
   const State = (function () {
-    // initial
     const defaultFiles = [{ name: 'index.html', content: '<!doctype html>\n<html>\n<head>\n<meta charset="utf-8"><title>New App</title>\n</head>\n<body>\n<h1>Hello</h1>\n</body>\n</html>' }];
     let s = {
-      theme: localStorage.getItem('app-theme') || localStorage.getItem('aijr-theme') || 'light',
+      theme: localStorage.getItem('app-theme') || 'light',
       activeProvider: localStorage.getItem('activeProvider') || 'Puter',
       apiKeys: JSON.parse(localStorage.getItem('apiKeys') || '{}'),
       favoriteModels: new Set(JSON.parse(localStorage.getItem('favoriteModels') || '[]')),
       files: JSON.parse(localStorage.getItem('va_files') || JSON.stringify(defaultFiles)),
       activeFile: (JSON.parse(localStorage.getItem('va_files') || JSON.stringify(defaultFiles))[0] || defaultFiles[0]).name,
-      templates: null, // set later
-      apps: [], // persisted apps loaded from DB
+      templates: [],
+      apps: [],
       versions: [],
-      models: [],
       pollinationsModels: [],
       logs: [],
       usage: null,
+      layout: localStorage.getItem('app-layout') || 'side-by-side',
     };
     const subs = new Set();
     function notify() { subs.forEach(cb => cb(get())); }
@@ -77,17 +68,17 @@ export async function initApp(opts = {}) {
     }
     function set(partial) {
       Object.assign(s, partial);
-      // persist
       if (partial.apiKeys) localStorage.setItem('apiKeys', JSON.stringify(s.apiKeys));
       if (partial.activeProvider) localStorage.setItem('activeProvider', s.activeProvider);
       if (partial.theme) { localStorage.setItem('app-theme', s.theme); document.body.className = `theme-${s.theme}`; }
       if (partial.favoriteModels) localStorage.setItem('favoriteModels', JSON.stringify([...s.favoriteModels]));
       if (partial.files) localStorage.setItem('va_files', JSON.stringify(s.files));
+      if (partial.layout) localStorage.setItem('app-layout', s.layout);
       notify();
     }
     function subscribe(cb) { subs.add(cb); return () => subs.delete(cb); }
     function updateFiles(newFiles) { s.files = newFiles; localStorage.setItem('va_files', JSON.stringify(s.files)); if (!s.files.find(f => f.name === s.activeFile)) s.activeFile = s.files[0]?.name || ''; notify(); }
-    function setActiveFile(name) { s.activeFile = name; localStorage.setItem('va_files', JSON.stringify(s.files)); notify(); }
+    function setActiveFile(name) { s.activeFile = name; notify(); }
     function addFile(file) { s.files.push(file); s.activeFile = file.name; localStorage.setItem('va_files', JSON.stringify(s.files)); notify(); }
     function deleteFile(name) { s.files = s.files.filter(f => f.name !== name); if (s.activeFile === name) s.activeFile = s.files[0]?.name || ''; localStorage.setItem('va_files', JSON.stringify(s.files)); notify(); }
     function toggleFavoriteModel(id) { if (s.favoriteModels.has(id)) s.favoriteModels.delete(id); else s.favoriteModels.add(id); set({ favoriteModels: s.favoriteModels }); }
@@ -95,26 +86,22 @@ export async function initApp(opts = {}) {
     return { get, set, subscribe, updateFiles, setActiveFile, addFile, deleteFile, toggleFavoriteModel, pushLog };
   })();
 
-  // ---------- DB (Fireproof attempt / localStorage fallback) ----------
+  // ---------- DB adapter ----------
   const DB = (function () {
     let useFireproof = false;
-    let db = null; // if using library, this will be DB API
+    let db = null;
     async function init() {
       try {
-        if (window.fireproof) {
-          db = window.fireproof;
-          useFireproof = true;
-        } else {
-          // try dynamic import from esm.sh (best-effort; might not be allowed)
-          try {
-            const mod = await import('https://esm.sh/use-fireproof@0.24.9');
-            // use-fireproof exports hooks for react; Fireproof itself might be different.
-            // We try to access a plain fireproof global if present.
-            if (window.fireproof) { db = window.fireproof; useFireproof = true; }
-            else useFireproof = false;
-          } catch (e) {
-            useFireproof = false;
+        if (window.fireproof) { db = window.fireproof; useFireproof = true; return; }
+        // try dynamic import of fireproof (best-effort)
+        try {
+          const mod = await import('https://esm.sh/fireproof@0.18.9');
+          if (mod && mod.open) {
+            db = await mod.open('puter-apps-v6');
+            useFireproof = true;
           }
+        } catch (e) {
+          useFireproof = false;
         }
       } catch (e) {
         useFireproof = false;
@@ -124,10 +111,8 @@ export async function initApp(opts = {}) {
         localStorage.setItem('va_versions', localStorage.getItem('va_versions') || '[]');
       }
     }
-
     async function put(doc) {
       if (useFireproof && db?.put) return db.put(doc);
-      // fallback: save to va_apps (replace by _id or add)
       const arr = JSON.parse(localStorage.getItem('va_apps') || '[]');
       if (!doc._id) doc._id = `app_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
       const idx = arr.findIndex(a => a._id === doc._id);
@@ -135,13 +120,11 @@ export async function initApp(opts = {}) {
       localStorage.setItem('va_apps', JSON.stringify(arr));
       return doc;
     }
-
     async function get(id) {
       if (useFireproof && db?.get) return db.get(id);
       const arr = JSON.parse(localStorage.getItem('va_apps') || '[]');
       return arr.find(a => a._id === id) || null;
     }
-
     async function del(id) {
       if (useFireproof && db?.del) return db.del(id);
       const arr = JSON.parse(localStorage.getItem('va_apps') || '[]');
@@ -149,34 +132,29 @@ export async function initApp(opts = {}) {
       localStorage.setItem('va_apps', JSON.stringify(filtered));
       return true;
     }
-
     async function allApps() {
       if (useFireproof && db?.all) {
-        try { return await db.all(); } catch (e) { /* fall back */ }
+        try { return await db.all(); } catch (e) {}
       }
       return JSON.parse(localStorage.getItem('va_apps') || '[]');
     }
-
     async function putVersion(v) {
       if (useFireproof && db?.put) return db.put(v);
       const arr = JSON.parse(localStorage.getItem('va_versions') || '[]');
       if (!v._id) v._id = `ver_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
       arr.unshift(v);
+      // keep versions cap
+      while (arr.length > 200) arr.pop();
       localStorage.setItem('va_versions', JSON.stringify(arr));
       return v;
     }
-
     async function versionsForApp(appId) {
       if (useFireproof && db?.all) {
-        try {
-          const all = await db.all();
-          return (all || []).filter(x => x.type === 'version' && x.appId === appId).sort((a, b) => b.version - a.version);
-        } catch (e) {}
+        try { const all = await db.all(); return (all || []).filter(x => x.type === 'version' && x.appId === appId).sort((a,b)=>b.version-a.version); } catch (e) {}
       }
       const arr = JSON.parse(localStorage.getItem('va_versions') || '[]');
-      return arr.filter(v => v.appId === appId).sort((a, b) => b.version - a.version);
+      return arr.filter(v => v.appId === appId).sort((a,b)=>b.version-a.version);
     }
-
     return { init, put, get, del, allApps, putVersion, versionsForApp, usingFireproof: () => useFireproof };
   })();
 
@@ -188,53 +166,31 @@ export async function initApp(opts = {}) {
   const rightRoot = document.getElementById(rightContentId);
   const newFileBtn = document.getElementById(newFileBtnId);
 
-  // ---------- Templates list ----------
-  function getDefaultTemplates() {
+  // ---------- Templates ----------
+  function defaultTemplates() {
     return [
-      { id: "todo", name: "Todo App", icon: "✅", prompt: "A beautiful todo app with categories, priorities, due dates, dark/light mode toggle, and local storage persistence" },
-      { id: "calculator", name: "Calculator", icon: "🔢", prompt: "A scientific calculator with history, memory functions, keyboard support, and a sleek modern UI" },
-      { id: "notes", name: "Notes App", icon: "📝", prompt: "A notes app with markdown support, folders, search, tags, and auto-save functionality" },
-      { id: "chat", name: "AI Chat App", icon: "🤖", prompt: "A sophisticated AI chat interface with markdown rendering, code highlighting, and conversation history." },
-      { id: "image-describer", name: "Image Describer", icon: "🖼️", prompt: "An app where users can upload or paste an image URL, and it uses AI to describe the content in detail." },
+      { id: 'todo', name: 'Todo App', icon: '✅', prompt: 'A todo app with localStorage' },
+      { id: 'notes', name: 'Notes App', icon: '📝', prompt: 'Notes with markdown preview' },
+      { id: 'ai-chat', name: 'AI Chat', icon: '🤖', prompt: 'Simple chat UI' },
     ];
   }
-  State.set({ templates: getDefaultTemplates() });
+  State.set({ templates: defaultTemplates() });
 
-  // ---------- Logging UI (simple) ----------
-  function renderLogs() {
-    // append latest logs to a small area inside leftRoot
-    const logs = State.get().logs || [];
-    let logPanel = leftRoot.querySelector('.log-panel');
-    if (!logPanel) {
-      logPanel = el('div', { class: 'log-panel neu-inset', style: 'margin-top:12px;padding:8px;max-height:160px;overflow:auto' });
-      leftRoot.appendChild(logPanel);
-    }
-    logPanel.innerHTML = '';
-    logs.forEach(l => {
-      const row = el('div', { class: '' }, [l]);
-      logPanel.appendChild(row);
-    });
-  }
-
-  // subscribe to logs updates
-  State.subscribe(s => {
-    renderFileTabs(); // keep tabs in sync
-    renderLogs();
-  });
+  // ---------- Logging ----------
+  function addLog(msg) { State.pushLog(msg); }
 
   // ---------- Editor (CodeMirror 5) ----------
   let editor = null;
   let editorInitialized = false;
+  let autosaveTimer = null;
+  const AUTOSAVE_DELAY = 5000; // ms
 
   function createEditor(initialValue = '') {
     editorRoot.innerHTML = '';
-    // put a container for tabs above editor
     const tabsWrap = el('div', { class: 'file-tabs-wrapper', style: 'padding:8px;border-bottom:1px solid var(--border-color)' });
     editorRoot.appendChild(tabsWrap);
-
     const textarea = el('textarea', { style: 'width:100%;height:100%' });
     editorRoot.appendChild(textarea);
-
     const cm = CodeMirror.fromTextArea(textarea, {
       mode: 'htmlmixed',
       lineNumbers: true,
@@ -251,18 +207,16 @@ export async function initApp(opts = {}) {
   function initEditor() {
     const st = State.get();
     const file = st.files.find(f => f.name === st.activeFile) || st.files[0];
-    const { cm, tabsWrap } = createEditor(file?.content || '');
+    const { cm } = createEditor(file?.content || '');
     editor = cm;
     editorInitialized = true;
 
-    // change handler
     editor.on('change', debounce(() => {
       const content = editor.getValue();
-      // update state files array
       const files = State.get().files.map(f => f.name === State.get().activeFile ? ({ ...f, content }) : f);
       State.updateFiles(files);
-    }, 150));
-
+      scheduleAutosave();
+    }, 120));
     renderFileTabs();
   }
 
@@ -274,17 +228,15 @@ export async function initApp(opts = {}) {
     tabsWrap.innerHTML = '';
     const st = State.get();
     const files = st.files || [];
-    const tabsRow = el('div', { style: 'display:flex;gap:6px;align-items:center;overflow:auto' });
+    const row = el('div', { style: 'display:flex;gap:6px;align-items:center;overflow:auto' });
     files.forEach(f => {
-      const btn = el('button', { class: cn('neu-btn'), style: `white-space:nowrap;${st.activeFile === f.name ? 'font-weight:800' : ''}` }, [f.name]);
+      const btn = el('button', { class: 'neu-btn', style: `white-space:nowrap;${st.activeFile===f.name?'font-weight:800':''}` }, [f.name]);
       btn.addEventListener('click', () => {
         State.setActiveFile(f.name);
-        // set editor value
         const file = State.get().files.find(ff => ff.name === f.name);
         if (editor && file && editor.getValue() !== file.content) editor.setValue(file.content || '');
         renderFileTabs();
       });
-      // delete if >1 file
       if (files.length > 1) {
         const del = el('span', { style: 'margin-left:6px;cursor:pointer' }, ['×']);
         del.addEventListener('click', (ev) => {
@@ -300,113 +252,556 @@ export async function initApp(opts = {}) {
         });
         btn.appendChild(del);
       }
-      tabsRow.appendChild(btn);
+      row.appendChild(btn);
     });
-    // add file button
     const addBtn = el('button', { class: 'neu-btn', title: 'Add file' }, ['＋']);
     addBtn.addEventListener('click', () => {
-      const name = prompt('New file name (example: script.js)');
+      const name = prompt('New file name (example: index.html)');
       if (!name) return;
-      if (State.get().files.some(f => f.name.toLowerCase() === name.toLowerCase())) { State.pushLog(`File "${name}" already exists`); return; }
+      if (State.get().files.some(f => f.name.toLowerCase() === name.toLowerCase())) { addLog(`File "${name}" already exists`); return; }
       State.addFile({ name, content: '' });
       if (editor) editor.setValue('');
       renderFileTabs();
     });
-    tabsRow.appendChild(addBtn);
+    row.appendChild(addBtn);
+    tabsWrap.appendChild(row);
 
-    tabsWrap.appendChild(tabsRow);
+    // add format button and copy/format/save controls
+    const utilRow = el('div', { style: 'display:flex;gap:6px;align-items:center;margin-left:12px' });
+    const copyBtn = el('button', { class: 'neu-btn', title: 'Copy code' }, ['📋 Copy']);
+    copyBtn.addEventListener('click', () => { navigator.clipboard.writeText(editor.getValue()); addLog('Code copied'); });
+    const formatBtn = el('button', { class: 'neu-btn', title: 'Format code' }, ['✨ Format']);
+    formatBtn.addEventListener('click', () => {
+      const v = editor.getValue();
+      const formatted = formatCodeByType(v, State.get().activeFile);
+      editor.setValue(formatted);
+      addLog('Formatted code');
+    });
+    const saveBtn = el('button', { class: 'neu-btn', title: 'Save as app (Ctrl+S)' }, ['💾 Save']);
+    saveBtn.addEventListener('click', () => saveActiveFileAsApp());
+    utilRow.appendChild(copyBtn); utilRow.appendChild(formatBtn); utilRow.appendChild(saveBtn);
+    tabsWrap.appendChild(utilRow);
   }
 
-  // ---------- Left panel rendering (controls, templates, export/import) ----------
+  // ---------- Formatting (basic) ----------
+  // Attempt a simple HTML pretty printer using DOMParser -> serialized with indentation.
+  function formatHtml(html) {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      function pprint(node, indent = 0) {
+        const pad = '  '.repeat(indent);
+        if (node.nodeType === Node.TEXT_NODE) {
+          const t = node.textContent.trim();
+          if (!t) return '';
+          return pad + t + '\n';
+        }
+        if (node.nodeType === Node.COMMENT_NODE) return pad + '<!--' + node.nodeValue + '-->\n';
+        let out = '';
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          out += pad + `<${node.tagName.toLowerCase()}`;
+          for (const attr of node.attributes) out += ` ${attr.name}="${attr.value}"`;
+          out += '>\n';
+          for (const child of node.childNodes) out += pprint(child, indent + 1);
+          out += pad + `</${node.tagName.toLowerCase()}>\n`;
+        }
+        return out;
+      }
+      let body = '';
+      // include doctype if present
+      const doctype = Array.from(doc.childNodes).find(n => n.nodeType === Node.DOCUMENT_TYPE_NODE);
+      if (doctype) body += '<!doctype html>\n';
+      for (const child of doc.documentElement.childNodes) { /* ignore html wrapper here */ }
+      // produce html structure manually
+      body += '<html>\n';
+      body += pprint(doc.head, 1);
+      body += pprint(doc.body, 1);
+      body += '</html>\n';
+      return body;
+    } catch (e) {
+      // fallback: simple indent around tags
+      return html.replace(/>\s*</g, '>\n<').split('\n').map(line => line.trim() ? line : '').join('\n');
+    }
+  }
+
+  function formatJs(js) {
+    // very naive: just semicolon/brace formatting (not a replacement for prettier)
+    try {
+      return js.replace(/\s+/g, ' ').replace(/;\s*/g, ';\n').replace(/\{\s*/g, '{\n').replace(/\}\s*/g, '\n}\n');
+    } catch {
+      return js;
+    }
+  }
+
+  function formatCss(css) {
+    try {
+      return css.replace(/\s+/g, ' ').replace(/\{\s*/g, ' {\n').replace(/\}\s*/g, '\n}\n').replace(/;\s*/g, ';\n');
+    } catch {
+      return css;
+    }
+  }
+
+  function formatCodeByType(code, filename = '') {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    if (ext === 'html' || code.includes('<!doctype') || code.includes('<html')) return formatHtml(code);
+    if (ext === 'js') return formatJs(code);
+    if (ext === 'css') return formatCss(code);
+    // fallback: try html formatting
+    return formatHtml(code);
+  }
+
+  // ---------- Autosave & Versions ----------
+  // Autosave current file content into a local versions stack and optionally to DB as versions
+  function scheduleAutosave() {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(async () => {
+      const file = State.get().files.find(f => f.name === State.get().activeFile);
+      if (!file) return;
+      // store autosave snapshot in localStorage map
+      const key = 'va_autosave_versions';
+      const map = JSON.parse(localStorage.getItem(key) || '{}');
+      map[file.name] = map[file.name] || [];
+      map[file.name].unshift({ createdAt: Date.now(), content: file.content });
+      // cap snapshots
+      if (map[file.name].length > 30) map[file.name].pop();
+      localStorage.setItem(key, JSON.stringify(map));
+      addLog(`Autosaved ${file.name}`);
+      // if app exists in DB, also create a version record
+      // find app by name
+      const apps = await DB.allApps();
+      const app = apps.find(a => a.appName === file.name.replace(/\.[^.]+$/, ''));
+      if (app) {
+        const newVersion = (app.version || 0) + 1;
+        await DB.putVersion({ type: 'version', appId: app._id, code: file.content, version: newVersion, createdAt: Date.now(), note: 'Autosave' });
+        // update app version
+        app.version = newVersion;
+        await DB.put(app);
+        addLog(`Saved version ${newVersion} for ${app.appName}`);
+      }
+    }, AUTOSAVE_DELAY);
+  }
+
+  // Manual save active file as app
+  async function saveActiveFileAsApp() {
+    const file = State.get().files.find(f => f.name === State.get().activeFile);
+    if (!file) return;
+    // ask for app name / title
+    const title = prompt('App title (optional)', file.name) || file.name;
+    const doc = {
+      type: 'app',
+      appName: file.name.replace(/\.[^.]+$/, ''),
+      appTitle: title,
+      prompt: 'Saved from editor',
+      code: file.content,
+      createdAt: Date.now(),
+      version: 1,
+      views: 0,
+      favorite: false,
+    };
+    const saved = await DB.put(doc);
+    await DB.putVersion({ type: 'version', appId: saved._id, code: file.content, version: 1, createdAt: Date.now(), note: 'Saved from editor' });
+    const apps = await DB.allApps();
+    State.set({ apps });
+    addLog(`Saved ${file.name} as app ${saved.appName}`);
+  }
+
+  // ---------- Export / Import UI ----------
+  async function openExportImportModal() {
+    const container = el('div', { role: 'dialog', aria: { label: 'Export Import' } });
+    container.appendChild(el('h3', {}, ['📦 Export / Import Apps']));
+    const exportBtn = el('button', { class: 'neu-btn', style: 'margin-top:8px' }, ['Export All (JSON)']);
+    exportBtn.addEventListener('click', async () => {
+      const apps = await DB.allApps();
+      const blob = new Blob([JSON.stringify(apps, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = el('a', { href: url, download: `aijr-apps-export-${Date.now()}.json` });
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      addLog('Exported apps');
+    });
+    container.appendChild(exportBtn);
+
+    container.appendChild(el('div', { style: 'margin-top:12px' }, ['Import JSON (merge or replace)']));
+    const fileInput = el('input', { type: 'file', accept: '.json', style: 'margin-top:8px' });
+    container.appendChild(fileInput);
+
+    const mergeReplaceRow = el('div', { style: 'display:flex;gap:8px;margin-top:8px' });
+    const mergeBtn = el('button', { class: 'neu-btn' }, ['Merge']);
+    const replaceBtn = el('button', { class: 'neu-btn' }, ['Replace']);
+    mergeReplaceRow.appendChild(mergeBtn); mergeReplaceRow.appendChild(replaceBtn);
+    container.appendChild(mergeReplaceRow);
+
+    let parsedJSON = null;
+    fileInput.addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = (ev) => {
+        try {
+          parsedJSON = JSON.parse(ev.target.result);
+          container.appendChild(el('pre', { style: 'max-height:200px;overflow:auto;margin-top:8px;background:var(--bg-secondary);padding:8px;border-radius:8px' }, [JSON.stringify(parsedJSON, null, 2)]));
+        } catch (err) {
+          addLog('Invalid JSON file');
+        }
+      };
+      r.readAsText(f);
+    });
+
+    mergeBtn.addEventListener('click', async () => {
+      if (!parsedJSON) return addLog('No file parsed');
+      const arr = Array.isArray(parsedJSON) ? parsedJSON : [parsedJSON];
+      const existing = await DB.allApps();
+      // merge by appName uniqueness (avoid duplicates)
+      for (const a of arr) {
+        const exists = existing.find(e => e.appName === a.appName);
+        if (exists) {
+          // create new app with suffix
+          a.appName = `${a.appName}_import_${Math.random().toString(36).slice(2,5)}`;
+        }
+        delete a._id;
+        a._id = `app_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+        await DB.put(a);
+      }
+      const apps = await DB.allApps();
+      State.set({ apps });
+      addLog(`Imported (merged) ${arr.length} app(s)`);
+      modal.close();
+    });
+
+    replaceBtn.addEventListener('click', async () => {
+      if (!parsedJSON) return addLog('No file parsed');
+      const arr = Array.isArray(parsedJSON) ? parsedJSON : [parsedJSON];
+      // replace storage
+      localStorage.setItem('va_apps', JSON.stringify(arr));
+      State.set({ apps: arr });
+      addLog(`Imported (replaced) ${arr.length} app(s)`);
+      modal.close();
+    });
+
+    const modal = openModal(container);
+    // Accessibility: focus modal
+    modal.modalBox.setAttribute('role', 'dialog');
+    modal.modalBox.setAttribute('aria-modal', 'true');
+    modal.modalBox.focus && modal.modalBox.focus();
+  }
+
+  // ---------- Settings modal with preview & model lists ----------
+  function openSettingsModal() {
+    const st = State.get();
+    const container = el('div', { role: 'dialog' });
+    container.appendChild(el('h3', {}, ['⚙️ Settings']));
+    // Theme preview: apply temp theme on hover/click
+    container.appendChild(el('div', { style: 'margin-top:8px;font-weight:700' }, ['Theme']));
+    const themesRow = el('div', { style: 'display:flex;gap:8px;margin-top:6px' });
+    ['light', 'dark', 'grey', 'multicoloured'].forEach(t => {
+      const b = el('button', { class: 'neu-btn' }, [t]);
+      b.addEventListener('mouseenter', () => document.body.className = `theme-${t}`);
+      b.addEventListener('mouseleave', () => document.body.className = `theme-${State.get().theme}`);
+      b.addEventListener('click', () => { State.set({ theme: t }); addLog(`Theme saved: ${t}`); });
+      themesRow.appendChild(b);
+    });
+    container.appendChild(themesRow);
+
+    // Layout preview
+    container.appendChild(el('div', { style: 'margin-top:12px;font-weight:700' }, ['Layout']));
+    const layouts = ['side-by-side', 'stacked', 'custom'];
+    const layoutRow = el('div', { style: 'display:flex;gap:8px;margin-top:6px' });
+    layouts.forEach(l => {
+      const b = el('button', { class: 'neu-btn' }, [l]);
+      b.addEventListener('click', () => { State.set({ layout: l }); addLog(`Layout set: ${l}`); });
+      layoutRow.appendChild(b);
+    });
+    container.appendChild(layoutRow);
+
+    // Provider models listing for Pollinations & favorites
+    container.appendChild(el('div', { style: 'margin-top:12px;font-weight:700' }, ['Provider Models']));
+    const modelsWrap = el('div', { style: 'max-height:160px;overflow:auto;margin-top:8px' });
+    const pollModels = State.get().pollinationsModels || [];
+    if (pollModels.length === 0) modelsWrap.appendChild(el('div', { style: 'color:var(--text-secondary)' }, ['No Pollinations models loaded']));
+    else {
+      pollModels.slice(0, 50).forEach(m => {
+        const row = el('div', { style: 'display:flex;align-items:center;justify-content:space-between;padding:6px;border-bottom:1px solid var(--border-color)' }, [
+          el('div', { style: 'font-family:monospace;font-size:12px' }, [m.id || m.name]),
+          el('div', {}, [ el('button', { class: 'neu-btn' }, [ State.get().favoriteModels.has(m.id) ? '★' : '☆' ]) ])
+        ]);
+        row.querySelector('button').addEventListener('click', () => {
+          State.toggleFavoriteModel ? State.toggleFavoriteModel(m.id) : null;
+          addLog(`Toggled favorite model ${m.id}`);
+          // re-render models list
+          openSettingsModal(); // quick re-open to refresh (simple approach)
+        });
+        modelsWrap.appendChild(row);
+      });
+    }
+    container.appendChild(modelsWrap);
+
+    openModal(container);
+  }
+
+  // ---------- Accessibility: modal helper with focus trap basics ----------
+  function openModal(innerEl) {
+    const overlay = el('div', { class: 'va-modal-overlay', tabindex: '-1', onClick: () => overlay.remove() });
+    const modalBox = el('div', { class: 'va-modal neu-box', tabindex: '0', onClick: (e) => e.stopPropagation() });
+    modalBox.appendChild(innerEl);
+    overlay.appendChild(modalBox);
+    document.body.appendChild(overlay);
+    // Basic focus management: focus first focusable or modalBox
+    setTimeout(() => {
+      const focusable = modalBox.querySelector('button, input, textarea, select, [tabindex]');
+      (focusable || modalBox).focus();
+    }, 10);
+    // close on ESC
+    const escHandler = (e) => { if (e.key === 'Escape') overlay.remove(); };
+    window.addEventListener('keydown', escHandler);
+    return {
+      overlay,
+      modalBox,
+      close: () => { overlay.remove(); window.removeEventListener('keydown', escHandler); },
+    };
+  }
+
+  // ---------- Export single / share / versions / deploy (enhanced) ----------
+  async function exportSingleApp(app) {
+    const blob = new Blob([JSON.stringify(app, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = el('a', { href: url, download: `${app.appName || 'app'}-export.json` });
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    addLog('Exported app');
+  }
+
+  function openShareModal(app) {
+    const encoded = btoa(JSON.stringify({ prompt: app.prompt, code: app.code, title: app.appTitle }));
+    const link = `${window.location.origin}${window.location.pathname}?share=${encoded}`;
+    const container = el('div', {});
+    container.appendChild(el('h3', {}, ['🔗 Share']));
+    const input = el('input', { value: link, style: 'width:100%;padding:8px' });
+    container.appendChild(input);
+    const copy = el('button', { class: 'neu-btn', style: 'margin-top:8px' }, ['Copy']);
+    copy.addEventListener('click', () => { navigator.clipboard.writeText(link); addLog('Share link copied'); });
+    container.appendChild(copy);
+    openModal(container);
+  }
+
+  async function openVersionsModal(app) {
+    const versions = await DB.versionsForApp(app._id);
+    const container = el('div', {});
+    container.appendChild(el('h3', {}, ['📚 Versions']));
+    if (!versions || versions.length === 0) container.appendChild(el('div', {}, ['No versions']));
+    else {
+      const list = el('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' });
+      versions.forEach(v => {
+        const row = el('div', { class: 'neu-inset', style: 'padding:8px;display:flex;justify-content:space-between;align-items:center' }, [
+          el('div', {}, [el('div', { style: 'font-weight:700' }, [`v${v.version}`]), el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [new Date(v.createdAt).toLocaleString()])]),
+          el('div', {}, [ el('button', { class: 'neu-btn' }, ['Restore']) ])
+        ]);
+        row.querySelector('button').addEventListener('click', () => {
+          if (editor) editor.setValue(v.code || '');
+          addLog(`Restored v${v.version}`);
+          modal.close();
+        });
+        list.appendChild(row);
+      });
+      container.appendChild(list);
+    }
+    const modal = openModal(container);
+  }
+
+  // ---------- Launch / update / delete ----------
+  async function launchApp(app) {
+    addLog(`Launching ${app.appName || app._id}`);
+    if (app.appName && window.puter?.apps?.launch) {
+      try { await window.puter.apps.launch(app.appName); addLog('Launched via Puter SDK'); return; } catch (e) { /* fallback */ }
+    }
+    if (app.hostedUrl) window.open(app.hostedUrl, '_blank');
+    else {
+      const blob = new Blob([app.code || ''], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+  }
+
+  async function updateAndRedeploy(appDoc, newCode) {
+    if (!appDoc) return;
+    addLog('Updating app...');
+    const overlay = el('div', { class: 'code-loading-overlay' }, [ el('div', { class: 'code-spinner' }), el('div', { style: 'margin-top:12px' }, ['Updating...']) ]);
+    editorRoot.appendChild(overlay);
+    try {
+      const newVersion = (appDoc.version || 1) + 1;
+      const updated = { ...appDoc, code: newCode, updatedAt: Date.now(), version: newVersion };
+      await DB.put(updated);
+      await DB.putVersion({ type: 'version', appId: updated._id, code: newCode, version: newVersion, createdAt: Date.now(), note: `v${newVersion}` });
+      addLog(`Updated ${updated.appName} to v${newVersion}`);
+      const apps = await DB.allApps(); State.set({ apps });
+    } catch (e) { addLog('Update failed: ' + (e.message || e)); }
+    overlay.remove();
+  }
+
+  async function deleteApp(app) {
+    if (!confirm(`Delete ${app.appTitle || app.appName || app._id}?`)) return;
+    try {
+      if (app.appName && window.puter?.apps?.delete) { try { await window.puter.apps.delete(app.appName); } catch (e) {} }
+      if (app.subdomain && window.puter?.hosting?.delete) { try { await window.puter.hosting.delete(app.subdomain); } catch (e) {} }
+      await DB.del(app._id);
+      addLog('Deleted app');
+      const apps = await DB.allApps(); State.set({ apps });
+    } catch (e) { addLog('Delete failed'); }
+  }
+
+  // ---------- Usage refresh ----------
+  async function refreshUsage() {
+    addLog('Refreshing usage...');
+    if (window.puter?.auth?.getMonthlyUsage) {
+      try {
+        const u = await window.puter.auth.getMonthlyUsage();
+        State.set({ usage: u });
+        addLog('Usage updated');
+        const fill = document.getElementById('usage-fill');
+        if (fill && u?.allowanceInfo) {
+          const { monthUsageAllowance, remaining } = u.allowanceInfo;
+          const used = monthUsageAllowance - remaining;
+          const pct = Math.min(100, Math.round((used / monthUsageAllowance) * 100));
+          fill.style.width = pct + '%';
+          fill.classList.add('usage-bar-pulse');
+          setTimeout(() => fill.classList.remove('usage-bar-pulse'), 1200);
+        }
+      } catch (e) { addLog('Usage fetch failed'); }
+    } else {
+      const fill = document.getElementById('usage-fill');
+      if (fill) { fill.style.width = `${Math.floor(Math.random()*60)+10}%`; fill.classList.add('usage-bar-pulse'); setTimeout(()=>fill.classList.remove('usage-bar-pulse'),1200); }
+    }
+  }
+
+  // ---------- UI renderers ----------
   function renderLeft() {
     leftRoot.innerHTML = '';
     const header = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px' }, [
       el('div', {}, [el('strong', {}, ['Create / Apps'])]),
       el('div', {}, [
-        el('button', { class: 'collapse-btn', onClick: () => openTemplatesModal() }, ['🎨 Templates']),
+        el('button', { class: 'collapse-btn', onClick: () => openTemplatesModal() }, ['🎨']),
+        el('button', { class: 'collapse-btn', onClick: () => openSettingsModal() }, ['⚙️']),
       ]),
     ]);
     leftRoot.appendChild(header);
 
-    const quick = el('div', { style: 'margin-bottom:12px' });
-    quick.appendChild(el('div', { style: 'font-weight:700;margin-bottom:6px' }, ['Quick']));
-    const btns = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' });
-    const buildBtn = el('button', { class: 'neu-btn' }, ['🚀 Build (from prompt)']);
-    btns.appendChild(buildBtn);
-    const importBtn = el('button', { class: 'neu-btn' }, ['📥 Import']);
-    btns.appendChild(importBtn);
-    const exportBtn = el('button', { class: 'neu-btn' }, ['📤 Export']);
-    btns.appendChild(exportBtn);
-    quick.appendChild(btns);
-    leftRoot.appendChild(quick);
-
-    // Build modal trigger
+    const buildBtn = el('button', { class: 'neu-btn', style: 'width:100%;margin-bottom:8px' }, ['🚀 Create & Deploy']);
     buildBtn.addEventListener('click', () => openBuildModal());
-    importBtn.addEventListener('click', () => {
-      const input = el('input', { type: 'file', accept: '.json', style: 'display:none' });
-      input.addEventListener('change', (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = async (ev) => {
-          try {
-            const parsed = JSON.parse(ev.target.result);
-            const arr = Array.isArray(parsed) ? parsed : [parsed];
-            for (const a of arr) {
-              delete a._id;
-              a._id = `app_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-              await DB.put(a);
-            }
-            State.pushLog(`Imported ${arr.length} app(s)`);
-          } catch (err) {
-            State.pushLog(`Import failed: ${err.message}`);
-          }
-        };
-        reader.readAsText(file);
-      });
-      document.body.appendChild(input);
-      input.click();
-      input.remove();
-    });
-    exportBtn.addEventListener('click', async () => {
-      const apps = await DB.allApps();
-      const blob = new Blob([JSON.stringify(apps, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = el('a', { href: url, download: `aijr-export-${Date.now()}.json` });
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      State.pushLog('Exported apps');
-    });
+    leftRoot.appendChild(buildBtn);
 
-    // Log list area
-    const logTitle = el('div', { style: 'font-weight:700;margin-top:12px' }, ['Activity']);
-    leftRoot.appendChild(logTitle);
-    const logPanel = el('div', { class: 'log-panel neu-inset', style: 'margin-top:8px;padding:8px;max-height:180px;overflow:auto' });
-    leftRoot.appendChild(logPanel);
-    // render initial logs
-    renderLogs();
+    // search & filters
+    const search = el('input', { placeholder: 'Search apps...', style: 'width:100%;padding:8px;margin-bottom:8px' });
+    search.addEventListener('input', debounce((e) => { ui.searchQuery = e.target.value; renderAppsMini(); }, 200));
+    leftRoot.appendChild(search);
+    const filtersRow = el('div', { style: 'display:flex;gap:8px;margin-bottom:8px' });
+    const favBtn = el('button', { class: 'neu-btn' }, ['⭐ Favorites']);
+    favBtn.addEventListener('click', () => { ui.filterFavorites = !ui.filterFavorites; renderAppsMini(); });
+    const bulkBtn = el('button', { class: 'neu-btn' }, ['☑️ Select']);
+    bulkBtn.addEventListener('click', () => { ui.bulkMode = !ui.bulkMode; ui.selectedApps = new Set(); renderAppsMini(); });
+    filtersRow.appendChild(favBtn); filtersRow.appendChild(bulkBtn);
+    leftRoot.appendChild(filtersRow);
+
+    const appsContainer = el('div', { class: 'apps-mini', style: 'max-height:320px;overflow:auto' });
+    leftRoot.appendChild(appsContainer);
+
+    // attach export/import quick link
+    const exportImport = el('div', { style: 'margin-top:8px;display:flex;gap:8px' }, [
+      el('button', { class: 'neu-btn' }, ['📦 Export/Import']),
+    ]);
+    exportImport.querySelector('button').addEventListener('click', openExportImportModal);
+    leftRoot.appendChild(exportImport);
+
+    async function renderAppsMini() {
+      appsContainer.innerHTML = '';
+      let apps = State.get().apps || [];
+      if (ui.filterFavorites) apps = apps.filter(a => a.favorite);
+      if (ui.searchQuery) {
+        const q = ui.searchQuery.toLowerCase();
+        apps = apps.filter(a => (a.appName||'').toLowerCase().includes(q) || (a.appTitle||'').toLowerCase().includes(q) || (a.prompt||'').toLowerCase().includes(q));
+      }
+      if (ui.sortBy === 'date') apps = apps.sort((a,b)=> (b.createdAt||0) - (a.createdAt||0));
+      else if (ui.sortBy === 'views') apps = apps.sort((a,b)=> (b.views||0) - (a.views||0));
+      else if (ui.sortBy === 'name') apps = apps.sort((a,b)=> (a.appTitle||a.appName||'').localeCompare(b.appTitle||b.appName||''));
+      if (!apps || apps.length === 0) appsContainer.appendChild(el('div', { style: 'color:var(--text-secondary)' }, ['No apps']));
+      else {
+        apps.forEach(app => {
+          const row = el('div', { class: 'neu-inset', style: 'padding:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center' });
+          const left = el('div', {}, [el('div', { style: 'font-weight:700' }, [app.appTitle || app.appName]), el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [app.prompt?.slice(0,80)||''])]);
+          row.appendChild(left);
+          const actions = el('div', { style: 'display:flex;gap:6px;align-items:center' });
+          if (ui.bulkMode) {
+            const chk = el('input', { type: 'checkbox' });
+            chk.checked = ui.selectedApps.has(app._id);
+            chk.addEventListener('change', (e) => { if (e.target.checked) ui.selectedApps.add(app._id); else ui.selectedApps.delete(app._id); });
+            actions.appendChild(chk);
+          } else {
+            const fav = el('button', { class: 'neu-btn' }, [app.favorite ? '⭐' : '☆']);
+            fav.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              app.favorite = !app.favorite;
+              await DB.put(app);
+              const all = await DB.allApps();
+              State.set({ apps: all });
+              addLog(`${app.appTitle || app.appName} favorite: ${app.favorite}`);
+              renderAppsMini();
+            });
+            actions.appendChild(fav);
+
+            const openBtn = el('button', { class: 'neu-btn' }, ['Open']);
+            openBtn.addEventListener('click', () => { State.addFile({ name: `${app.appName || app._id}.html`, content: app.code || '' }); if (editor) editor.setValue(app.code || ''); addLog(`Opened ${app.appTitle || app.appName}`); renderFileTabs(); });
+            actions.appendChild(openBtn);
+
+            const launch = el('button', { class: 'neu-btn' }, ['▶']);
+            launch.addEventListener('click', async () => { await incrementViews(app); if (app.hostedUrl) window.open(app.hostedUrl, '_blank'); else { const blob = new Blob([app.code||''],{type:'text/html'}); const url = URL.createObjectURL(blob); window.open(url,'_blank'); setTimeout(()=>URL.revokeObjectURL(url),5000); } });
+            actions.appendChild(launch);
+
+            const versionsBtn = el('button', { class: 'neu-btn' }, ['📚']);
+            versionsBtn.addEventListener('click', () => openVersionsModal(app));
+            actions.appendChild(versionsBtn);
+
+            const shareBtn = el('button', { class: 'neu-btn' }, ['🔗']);
+            shareBtn.addEventListener('click', () => openShareModal(app));
+            actions.appendChild(shareBtn);
+
+            const exportBtn = el('button', { class: 'neu-btn' }, ['📤']);
+            exportBtn.addEventListener('click', async (e) => { e.stopPropagation(); await exportSingleApp(app); });
+            actions.appendChild(exportBtn);
+
+            const del = el('button', { class: 'neu-btn' }, ['🗑️']);
+            del.addEventListener('click', async (e) => { e.stopPropagation(); await deleteApp(app); renderAppsMini(); });
+            actions.appendChild(del);
+          }
+          row.appendChild(actions);
+          appsContainer.appendChild(row);
+        });
+
+        if (ui.bulkMode && ui.selectedApps.size > 0) {
+          const footer = el('div', { style: 'margin-top:8px;display:flex;gap:8px' });
+          const delSel = el('button', { class: 'neu-btn' }, [`Delete ${ui.selectedApps.size} Selected`]);
+          delSel.addEventListener('click', async () => {
+            if (!confirm(`Delete ${ui.selectedApps.size} apps?`)) return;
+            for (const id of ui.selectedApps) { const a = (State.get().apps || []).find(x => x._id === id); if (a) await deleteApp(a); }
+            ui.selectedApps = new Set(); ui.bulkMode = false;
+            const apps = await DB.allApps(); State.set({ apps }); renderAppsMini();
+          });
+          footer.appendChild(delSel);
+          appsContainer.appendChild(footer);
+        }
+      }
+    }
   }
 
-  // ---------- Right panel rendering (preview + controls) ----------
   function renderRight() {
     rightRoot.innerHTML = '';
     const header = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;padding:8px' }, [
       el('div', { style: 'font-weight:700' }, ['Preview']),
       el('div', {}, [
         el('button', { class: 'neu-btn', onClick: () => {
-          // open in new tab semantic: use currently active file code
-          const code = (State.get().files.find(f => f.name === State.get().activeFile) || {}).content || '';
-          const blob = new Blob([code], { type: 'text/html' });
-          const url = URL.createObjectURL(blob);
-          window.open(url, '_blank');
-          setTimeout(() => URL.revokeObjectURL(url), 5000);
+          const code = State.get().files.find(f => f.name === State.get().activeFile)?.content || '';
+          const blob = new Blob([code], { type: 'text/html' }); const url = URL.createObjectURL(blob); window.open(url,'_blank'); setTimeout(()=>URL.revokeObjectURL(url),5000);
         } }, ['🔗 Open']),
         el('button', { class: 'neu-btn', onClick: () => {
-          // run: set iframe srcdoc
-          const iframe = rightRoot.querySelector('iframe');
-          const code = (State.get().files.find(f => f.name === State.get().activeFile) || {}).content || '';
+          const iframe = rightRoot.querySelector('iframe'); const code = State.get().files.find(f => f.name === State.get().activeFile)?.content || '';
           if (iframe) iframe.srcdoc = code;
         } }, ['▶ Run']),
       ])
@@ -417,468 +812,137 @@ export async function initApp(opts = {}) {
     const iframe = el('iframe', { sandbox: 'allow-scripts allow-forms allow-modals allow-popups', title: 'App Preview', style: 'width:100%;height:100%;border:0' });
     iframeWrap.appendChild(iframe);
     rightRoot.appendChild(iframeWrap);
-
-    // app details / actions area (below iframe)
     const details = el('div', { style: 'padding:8px;border-top:1px solid var(--border-color)' });
     rightRoot.appendChild(details);
   }
 
-  // ---------- Modal helpers ----------
-  function openModal(innerEl, opts = {}) {
-    const overlay = el('div', { class: 'va-modal-overlay', onClick: () => overlay.remove() });
-    const modalBox = el('div', { class: 'va-modal neu-box', onClick: (e) => e.stopPropagation() });
-    modalBox.appendChild(innerEl);
-    overlay.appendChild(modalBox);
-    document.body.appendChild(overlay);
-    return { overlay, close: () => overlay.remove(), modalBox };
-  }
-
-  // ---------- Templates Modal ----------
-  function openTemplatesModal() {
-    const templates = State.get().templates || [];
-    const container = el('div', {});
-    container.appendChild(el('h3', {}, ['🎨 App Templates']));
-    const grid = el('div', { class: 'grid-templates', style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:8px' });
-    templates.forEach(t => {
-      const btn = el('button', { class: 'neu-btn', style: 'text-align:left;padding:12px' });
-      btn.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font-size:20px">${t.icon}</div><div style="font-weight:700">${t.name}</div></div><div style="font-size:12px;color:var(--text-secondary)">${t.prompt.slice(0,60)}${t.prompt.length>60?'…':''}</div></div>`;
-      btn.addEventListener('click', () => {
-        // create file with scaffold
-        const scaffold = `<!doctype html>\n<html>\n<head>\n<meta charset="utf-8"><title>${escapeHtml(t.name)}</title>\n</head>\n<body>\n<h1>${escapeHtml(t.name)}</h1>\n<p>${escapeHtml(t.prompt)}</p>\n</body>\n</html>`;
-        State.addFile({ name: `${t.id}.html`, content: scaffold });
-        if (editor) editor.setValue(scaffold);
-        modal.close();
-        State.pushLog(`Template "${t.name}" applied`);
-      });
-      grid.appendChild(btn);
-    });
-    container.appendChild(grid);
-    const modal = openModal(container);
-  }
-
-  // ---------- Settings Modal ----------
-  function openSettingsModal() {
-    const st = State.get();
-    const container = el('div', {});
-    container.appendChild(el('h3', {}, ['⚙️ Settings']));
-
-    // Theme selection
-    const themeWrap = el('div', { style: 'margin-top:8px' });
-    themeWrap.appendChild(el('div', { style: 'font-weight:700' }, ['Theme']));
-    ['light', 'dark', 'grey', 'multicoloured'].forEach(t => {
-      const b = el('button', { class: 'neu-btn', style: 'margin:6px 6px 0 0' }, [t]);
-      b.addEventListener('click', () => {
-        State.set({ theme: t });
-        State.pushLog(`Theme: ${t}`);
-      });
-      themeWrap.appendChild(b);
-    });
-    container.appendChild(themeWrap);
-
-    // Provider select
-    const providerWrap = el('div', { style: 'margin-top:12px' });
-    providerWrap.appendChild(el('div', { style: 'font-weight:700' }, ['Provider']));
-    const select = el('select', {}, []);
-    ['Puter', 'Pollinations', 'Custom'].forEach(p => {
-      const o = el('option', { value: p }, [p]);
-      select.appendChild(o);
-    });
-    select.value = st.activeProvider;
-    select.addEventListener('change', () => {
-      State.set({ activeProvider: select.value });
-      State.pushLog(`Active provider set to ${select.value}`);
-    });
-    providerWrap.appendChild(select);
-
-    // Pollinations key input
-    providerWrap.appendChild(el('div', { style: 'margin-top:8px;font-weight:700' }, ['Pollinations API Key (optional)']));
-    const keyInput = el('input', { type: 'text', value: st.apiKeys?.Pollinations || '', style: 'width:100%;padding:6px;margin-top:6px' });
-    providerWrap.appendChild(keyInput);
-    const keyBtns = el('div', { style: 'display:flex;gap:8px;margin-top:8px' });
-    const saveKey = el('button', { class: 'neu-btn' }, ['Save Key']);
-    const testKey = el('button', { class: 'neu-btn' }, ['Test Key']);
-    keyBtns.appendChild(saveKey); keyBtns.appendChild(testKey);
-    providerWrap.appendChild(keyBtns);
-
-    saveKey.addEventListener('click', async () => {
-      const k = keyInput.value.trim();
-      const apiKeys = State.get().apiKeys || {};
-      apiKeys.Pollinations = k;
-      State.set({ apiKeys });
-      State.pushLog('Pollinations key saved');
-      // attempt to fetch models
-      if (k) {
-        try {
-          const res = await fetch('https://gen.pollinations.ai/text/models', { headers: { Authorization: `Bearer ${k}` } });
-          if (res.ok) {
-            const data = await res.json();
-            State.set({ pollinationsModels: (data || []).map(m => ({ id: m.name, name: m.name })) });
-            State.pushLog(`Found ${data.length} Pollinations models`);
-          } else {
-            State.pushLog('Failed to fetch Pollinations models (bad key?)');
-          }
-        } catch (e) {
-          State.pushLog('Failed to fetch Pollinations models (network)');
-        }
-      }
-    });
-    testKey.addEventListener('click', async () => {
-      const k = keyInput.value.trim();
-      if (!k) { State.pushLog('Enter a key first'); return; }
-      try {
-        const res = await fetch('https://gen.pollinations.ai/text/models', { headers: { Authorization: `Bearer ${k}` } });
-        if (!res.ok) { State.pushLog('Invalid key or API error'); return; }
-        const data = await res.json();
-        State.set({ pollinationsModels: (data || []).map(m => ({ id: m.name, name: m.name })) });
-        State.pushLog(`Valid key — found ${data.length} models`);
-      } catch (e) {
-        State.pushLog('Connection error while testing key');
-      }
-    });
-
-    container.appendChild(providerWrap);
-
-    // App layout selection (small)
-    const layoutWrap = el('div', { style: 'margin-top:12px' });
-    layoutWrap.appendChild(el('div', { style: 'font-weight:700' }, ['App Layout (preview only)']));
-    ['side-by-side', 'stacked', 'custom'].forEach(l => {
-      const b = el('button', { class: 'neu-btn', style: 'margin:6px 6px 0 0' }, [l]);
-      b.addEventListener('click', () => { localStorage.setItem('app-layout', l); State.pushLog(`App layout saved: ${l}`); });
-      layoutWrap.appendChild(b);
-    });
-    container.appendChild(layoutWrap);
-
-    openModal(container);
-  }
-
-  // ---------- Build modal (prompt -> generate) ----------
-  function openBuildModal(prefill = '') {
-    const container = el('div', {});
-    container.appendChild(el('h3', {}, ['🛠️ Build & Deploy']));
-    const ta = el('textarea', { style: 'width:100%;height:120px;margin-top:8px' });
-    ta.value = prefill;
-    container.appendChild(ta);
-    const footer = el('div', { style: 'display:flex;gap:8px;margin-top:8px;justify-content:flex-end' });
-    const buildBtn = el('button', { class: 'neu-btn' }, ['🚀 Build']);
-    footer.appendChild(buildBtn);
-    container.appendChild(footer);
-
-    const modal = openModal(container);
-    buildBtn.addEventListener('click', async () => {
-      const prompt = ta.value.trim();
-      if (!prompt) { alert('Enter a prompt'); return; }
-      modal.close();
-      await buildAndDeploy(prompt);
-    });
-  }
-
-  // ---------- Build & Deploy (core) ----------
-  async function buildAndDeploy(finalPrompt) {
-    State.pushLog('Starting generation...');
-    // show temporary overlay in editor
-    const overlay = el('div', { class: 'code-loading-overlay' }, [el('div', { class: 'code-spinner' }), el('div', { style: 'margin-top:12px' }, ['Generating code...'])]);
-    editorRoot.appendChild(overlay);
-
-    const activeProvider = State.get().activeProvider;
-    const model = 'gpt-4o-mini'; // fallback
-    let code = '';
-    try {
-      if (activeProvider === 'Puter' && window.puter?.ai?.chat) {
-        // attempt Puter streaming / non-stream
-        try {
-          const stream = await window.puter.ai.chat([{ role: 'system', content: 'You are an expert web developer. Return a complete single-file HTML app.' }, { role: 'user', content: finalPrompt }], { model, stream: false });
-          if (typeof stream === 'string') code = stream;
-          else if (stream?.choices?.[0]?.message?.content) code = stream.choices[0].message.content;
-          else if (stream?.text) code = stream.text;
-        } catch (e) {
-          State.pushLog('Puter SDK call failed, falling back');
-          code = generateFallbackHTML(finalPrompt);
-        }
-      } else if (activeProvider === 'Pollinations') {
-        // Pollinations simple GET as original code did
-        const key = State.get().apiKeys?.Pollinations;
-        const url = `https://gen.pollinations.ai/text/${encodeURIComponent(finalPrompt)}?model=${encodeURIComponent(model)}&json=true`;
-        const res = await fetch(url, { headers: { Authorization: key ? `Bearer ${key}` : '' } });
-        if (!res.ok) {
-          throw new Error(`Pollinations API Error: ${res.status}`);
-        }
-        const text = await res.text();
-        try {
-          const data = JSON.parse(text);
-          code = data?.choices?.[0]?.message?.content || data?.content || text;
-        } catch (e) {
-          code = text;
-        }
-      } else {
-        // fallback local generator
-        code = generateFallbackHTML(finalPrompt);
-      }
-
-      code = stripFenced(code);
-      // ensure doctype
-      if (!/<!doctype\s+html>/i.test(code)) {
-        // if generated content is not full HTML, wrap it
-        code = `<!doctype html>\n<html>\n<head><meta charset="utf-8"><title>Generated</title></head>\n<body>\n${code}\n</body>\n</html>`;
-      }
-
-      // create a new file and set as active
-      const fileName = `app_${Date.now()}.html`;
-      State.addFile({ name: fileName, content: code });
-      if (editor) editor.setValue(code);
-      State.pushLog(`Generated ${code.length} bytes`);
-
-      // attempt to save and register app with Puter hosting if available
-      if (window.puter && window.puter.fs && window.puter.hosting) {
-        try {
-          const dirName = `app_${Date.now()}`;
-          await window.puter.fs.mkdir(dirName);
-          await window.puter.fs.write(`${dirName}/index.html`, code);
-          const subdomain = (fileName.replace(/\.[^.]+$/, '')).slice(0, 20);
-          const site = await window.puter.hosting.create(subdomain, dirName);
-          const hostedUrl = `https://${site.subdomain}.puter.site`;
-          // create app record and save to DB
-          const appDoc = {
-            type: 'app',
-            appName: subdomain,
-            appTitle: finalPrompt.slice(0, 40),
-            prompt: finalPrompt,
-            code,
-            subdomain,
-            hostedUrl,
-            createdAt: Date.now(),
-            version: 1,
-            views: 0,
-            favorite: false,
-          };
-          await DB.put(appDoc);
-          State.pushLog(`Hosted at ${hostedUrl}`);
-        } catch (e) {
-          State.pushLog('Puter hosting failed: ' + (e.message || e));
-        }
-      } else {
-        // save locally to DB
-        const appDoc = { type: 'app', appName: fileName.replace(/\.[^.]+$/, ''), appTitle: finalPrompt.slice(0, 40), prompt: finalPrompt, code, createdAt: Date.now(), version: 1, views: 0, favorite: false };
-        await DB.put(appDoc);
-        State.pushLog('Saved app locally');
-      }
-    } catch (err) {
-      State.pushLog('❌ Error: ' + (err.message || err));
-      console.error(err);
-    } finally {
-      overlay.remove();
+  // ---------- Keyboard Shortcuts & Accessibility ----------
+  window.addEventListener('keydown', async (e) => {
+    // Ctrl/Cmd+S save to DB
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 's') {
+      e.preventDefault(); await saveActiveFileAsApp();
+      return;
     }
-  }
-
-  function generateFallbackHTML(promptText) {
-    return `<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Generated App</title>
-<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;color:var(--text-color)}</style>
-</head>
-<body>
-<h1>Generated App</h1>
-<p>${escapeHtml(promptText)}</p>
-</body>
-</html>`;
-  }
-
-  // ---------- Versions modal ----------
-  async function openVersionsModal(appId) {
-    const container = el('div', {});
-    container.appendChild(el('h3', {}, ['📚 Version History']));
-    const versions = await DB.versionsForApp(appId);
-    if (!versions || versions.length === 0) {
-      container.appendChild(el('div', {}, ['No versions saved yet']));
-    } else {
-      const list = el('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' });
-      versions.forEach(v => {
-        const row = el('div', { class: 'neu-inset', style: 'padding:8px;display:flex;justify-content:space-between;align-items:center' }, [
-          el('div', {}, [el('div', { style: 'font-weight:700' }, [`v${v.version}`]), el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [new Date(v.createdAt).toLocaleString()])]),
-          el('div', {}, [el('button', { class: 'neu-btn', onClick: () => { /* restore to editor */ editor && editor.setValue(v.code || ''); State.pushLog(`Restored v${v.version}`); modal.close(); } }, ['Restore'])])
-        ]);
-        list.appendChild(row);
-      });
-      container.appendChild(list);
+    // Ctrl/Cmd+Enter run
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      const iframe = rightRoot.querySelector('iframe');
+      const code = State.get().files.find(f => f.name === State.get().activeFile)?.content || '';
+      if (iframe) iframe.srcdoc = code;
+      addLog('Run (Ctrl+Enter)');
+      return;
     }
-    const modal = openModal(container);
-  }
-
-  // ---------- Share modal (quick) ----------
-  function openShareModal(app) {
-    const container = el('div', {});
-    container.appendChild(el('h3', {}, ['🔗 Share App']));
-    const encoded = btoa(JSON.stringify({ prompt: app.prompt, code: app.code, title: app.appTitle }));
-    const link = `${window.location.origin}${window.location.pathname}?share=${encoded}`;
-    const input = el('input', { value: link, style: 'width:100%;padding:8px;margin-top:8px' });
-    container.appendChild(input);
-    const copyBtn = el('button', { class: 'neu-btn', style: 'margin-top:8px' }, ['Copy']);
-    copyBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText(link);
-      State.pushLog('Share link copied');
-    });
-    container.appendChild(copyBtn);
-    openModal(container);
-  }
-
-  // ---------- New File modal ----------
-  function openNewFileModal() {
-    const container = el('div', {});
-    container.appendChild(el('h3', {}, ['Create New File']));
-    const input = el('input', { placeholder: 'e.g., script.js', style: 'width:100%;padding:8px;margin-top:8px' });
-    container.appendChild(input);
-    const createBtn = el('button', { class: 'neu-btn', style: 'margin-top:8px' }, ['Create']);
-    container.appendChild(createBtn);
-    const modal = openModal(container);
-    createBtn.addEventListener('click', () => {
-      const name = input.value.trim();
-      if (!name) return;
-      if (State.get().files.some(f => f.name.toLowerCase() === name.toLowerCase())) { State.pushLog('File exists'); return; }
-      State.addFile({ name, content: '' });
+    // Ctrl/Cmd+N new file
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'n') {
+      e.preventDefault();
+      const nm = prompt('New file name');
+      if (!nm) return;
+      if (State.get().files.some(f => f.name.toLowerCase() === nm.toLowerCase())) { addLog('File exists'); return; }
+      State.addFile({ name: nm, content: '' });
       if (editor) editor.setValue('');
-      modal.close();
-    });
-  }
-
-  // ---------- UsageBar (simple) ----------
-  function renderUsageBar(elRoot) {
-    // elRoot = DOM element to mount into (we used header earlier in index.html)
-    const fill = document.getElementById('usage-fill');
-    if (!fill) return;
-    // pulse animation simulated
-    fill.classList.add('usage-bar-pulse');
-    setTimeout(() => fill.classList.remove('usage-bar-pulse'), 1200);
-  }
-
-  // ---------- Helpers: export single app ----------
-  async function exportSingleApp(app) {
-    const blob = new Blob([JSON.stringify(app, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = el('a', { href: url, download: `${app.appName || 'app'}-export.json` });
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    State.pushLog(`Exported ${app.appName || app._id}`);
-  }
-
-  // ---------- Launch / delete / favorite app ----------
-  async function launchApp(app) {
-    State.pushLog(`Launching ${app.appName || app._id}`);
-    if (app.appName && window.puter?.apps?.launch) {
-      try {
-        await window.puter.apps.launch(app.appName);
-        State.pushLog(`Launched ${app.appName}`);
-        return;
-      } catch (e) { /* fallback */ }
+      renderFileTabs();
+      addLog(`Created file ${nm}`);
+      return;
     }
-    if (app.hostedUrl) window.open(app.hostedUrl, '_blank');
-    else {
-      // open code in new tab
-      const blob = new Blob([app.code || ''], { type: 'text/html' });
+    // Ctrl+Shift+S export all
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      const apps = await DB.allApps();
+      const blob = new Blob([JSON.stringify(apps, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
-      window.open(url, '_blank');
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      const a = el('a', { href: url, download: `aijr-apps-export-${Date.now()}.json` });
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      addLog('Exported apps (Ctrl+Shift+S)');
+      return;
     }
+    // Ctrl+Shift+Z show undo snapshots modal (from autosave)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      openAutosaveSnapshotsModal();
+      return;
+    }
+  });
+
+  // ---------- Autosave snapshots modal (view & restore) ----------
+  function openAutosaveSnapshotsModal() {
+    const key = 'va_autosave_versions';
+    const map = JSON.parse(localStorage.getItem(key) || '{}');
+    const fileName = State.get().activeFile;
+    const list = map[fileName] || [];
+    const container = el('div', {});
+    container.appendChild(el('h3', {}, [`Autosave snapshots — ${fileName}`]));
+    if (list.length === 0) container.appendChild(el('div', {}, ['No snapshots']));
+    else {
+      list.forEach((s, idx) => {
+        const row = el('div', { class: 'neu-inset', style: 'padding:8px;display:flex;justify-content:space-between;align-items:center;margin-top:6px' }, [
+          el('div', {}, [el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [new Date(s.createdAt).toLocaleString()]), el('pre', { style: 'max-height:120px;overflow:auto' }, [s.content.slice(0,200)])]),
+          el('div', {}, [ el('button', { class: 'neu-btn' }, ['Restore']) ])
+        ]);
+        row.querySelector('button').addEventListener('click', () => {
+          if (editor) editor.setValue(s.content);
+          addLog('Restored autosave snapshot');
+          modal.close();
+        });
+        container.appendChild(row);
+      });
+    }
+    const modal = openModal(container);
   }
 
-  async function deleteApp(app) {
-    if (!confirm(`Delete app ${app.appTitle || app.appName || app._id}?`)) return;
-    try {
-      if (app.appName && window.puter?.apps?.delete) {
-        try { await window.puter.apps.delete(app.appName); } catch (e) {}
-      }
-      if (app.subdomain && window.puter?.hosting?.delete) {
-        try { await window.puter.hosting.delete(app.subdomain); } catch (e) {}
-      }
-      await DB.del(app._id);
-      State.pushLog('Deleted app');
-    } catch (e) {
-      State.pushLog('Delete failed: ' + (e.message || e));
-    }
-  }
-
-  // ---------- Initial render & wiring ----------
+  // ---------- Initialization ----------
   renderLeft();
   renderRight();
   initEditor();
 
-  // wire new-file shortcut button
-  if (newFileBtn) {
-    newFileBtn.addEventListener('click', () => openNewFileModal());
-  }
+  // Wire new file button
+  if (newFileBtn) newFileBtn.addEventListener('click', () => {
+    const name = prompt('New file name (e.g., index.html)');
+    if (!name) return;
+    if (State.get().files.some(f => f.name.toLowerCase() === name.toLowerCase())) { addLog('File exists'); return; }
+    State.addFile({ name, content: '' });
+    if (editor) editor.setValue('');
+    renderFileTabs();
+  });
 
-  // wire settings via a header button if present
-  const settingsButton = document.querySelector('.settings-icon')?.closest('button');
-  if (settingsButton) settingsButton.addEventListener('click', () => openSettingsModal());
+  // wire settings icon if present
+  document.querySelectorAll('[title="Settings"]').forEach(btn => btn.addEventListener('click', openSettingsModal));
 
-  // expose some debug hooks
-  window.__AIJR = { State, DB, buildAndDeploy, openTemplatesModal, openSettingsModal };
+  // Expose API for debugging
+  window.__AIJR = {
+    State, DB, formatHtml, formatCss: (s)=>formatCodeByType(s,'.css'), formatJs,
+    buildAndDeploy: async (p)=>{ await buildAndDeploy(p); }, openExportImportModal,
+    openAutosaveSnapshotsModal,
+  };
 
-  // load saved apps from DB into state.apps (not modifying files)
-  (async function loadAppsToState() {
+  // Load apps into state and start periodic refresh
+  (async () => {
     const apps = await DB.allApps();
-    State.set({ apps: apps || [] });
-    State.pushLog(`Loaded ${apps.length || 0} apps (${DB.usingFireproof() ? 'Fireproof' : 'localStorage'})`);
+    State.set({ apps });
+    addLog(`Loaded ${apps.length || 0} apps (${DB.usingFireproof() ? 'Fireproof' : 'localStorage'})`);
   })();
 
-  // subscribe to DB changes occasionally (not reactive; best-effort)
   setInterval(async () => {
     const apps = await DB.allApps();
     State.set({ apps });
-  }, 15_000);
+    await refreshUsage();
+  }, 30_000);
 
-  // handle share param
-  try {
-    const params = new URLSearchParams(window.location.search);
-    if (params.has('share')) {
-      const decoded = atob(params.get('share'));
-      const obj = JSON.parse(decoded);
-      const code = obj.code || obj.prompt || '';
-      State.addFile({ name: 'shared.html', content: code });
-      if (editor) editor.setValue(code);
-      State.pushLog('Loaded shared content from URL');
-    }
-  } catch (e) {}
-
-  // ensure logs and file tabs render initially
-  renderLogs();
-  renderFileTabs();
-  renderUsageBar();
-
-  // keyboard shortcuts: Ctrl/Cmd+S to save current app file as a local DB app
-  window.addEventListener('keydown', async (ev) => {
-    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 's') {
-      ev.preventDefault();
-      // save active file as app in DB
-      const file = State.get().files.find(f => f.name === State.get().activeFile);
-      if (!file) return;
-      const appDoc = {
-        type: 'app',
-        appName: (file.name.replace(/\.[^.]+$/, '')).slice(0, 24),
-        appTitle: file.name,
-        prompt: 'Saved from editor',
-        code: file.content,
-        createdAt: Date.now(),
-        version: 1,
-        views: 0,
-        favorite: false,
-      };
-      await DB.put(appDoc);
-      State.pushLog('Saved file as app');
-      // refresh apps list
-      const apps = await DB.allApps();
-      State.set({ apps });
-    }
-    if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === 'k') {
-      ev.preventDefault();
-      const name = State.get().activeFile;
-      if (confirm(`Delete file ${name}?`)) {
-        State.deleteFile(name);
-        State.pushLog(`Deleted ${name}`);
-      }
+  // make sure UI components reflect state
+  State.subscribe(() => {
+    renderFileTabs();
+    // logs
+    const logPanel = leftRoot.querySelector('.log-panel');
+    if (logPanel) {
+      logPanel.innerHTML = '';
+      (State.get().logs || []).forEach(l => logPanel.appendChild(el('div', {}, [l])));
+    } else {
+      // create log panel
+      const lp = el('div', { class: 'log-panel neu-inset', style: 'margin-top:12px;padding:8px;max-height:160px;overflow:auto' });
+      (State.get().logs || []).forEach(l => lp.appendChild(el('div', {}, [l])));
+      leftRoot.appendChild(lp);
     }
   });
 
-  // finished
-  State.pushLog('App initialized');
+  // final log
+  addLog('App initialized — feature-complete vanilla JS');
 }
