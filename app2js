@@ -1,0 +1,370 @@
+// app2.js — Chunk 2 (approx lines 500-1000 of script.jsx converted to vanilla JS)
+// Adds: Templates modal, New File modal, CollapseButton, UsageBar, and Left Panel (Create / Apps).
+// Meant to be loaded after app.js (chunk 1). Integrates with window.AIJR if present.
+
+(function () {
+  // Ensure base API from chunk1 exists
+  window.AIJR = window.AIJR || {};
+  const pushLog = window.AIJR.pushLog || ((m) => console.log(m));
+  const settings = window.AIJR.settings || { theme: "light", activeProvider: "Puter" };
+
+  // Utilities (lightweight, repeated if needed)
+  function el(tag, attrs = {}, ...children) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") n.className = v;
+      else if (k === "style" && typeof v === "object") Object.assign(n.style, v);
+      else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+      else if (k === "html") n.innerHTML = v;
+      else n.setAttribute(k, v);
+    }
+    for (const c of children) {
+      if (c == null) continue;
+      n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+    return n;
+  }
+  function qs(sel, root = document) { return root.querySelector(sel); }
+  function qsa(sel, root = document) { return Array.from(root.querySelectorAll(sel)); }
+
+  // Create main 3-panel layout if it's not already created by other chunks
+  const container = document.getElementById("container") || document.body;
+  let mainWrap = qs("#aijr-main", container);
+  if (!mainWrap) {
+    mainWrap = el("div", { id: "aijr-main", style: { display: "flex", gap: "12px", padding: "12px" } });
+    // Insert after header if header exists
+    const header = container.querySelector(".app-header") || container.firstChild;
+    if (header && header.parentNode) header.parentNode.insertBefore(mainWrap, header.nextSibling);
+    else container.appendChild(mainWrap);
+  }
+
+  // Left panel container
+  let leftPanel = qs("#aijr-left", mainWrap);
+  if (!leftPanel) {
+    leftPanel = el("div", { id: "aijr-left", style: { width: "320px", minWidth: "200px", flexShrink: "0" } });
+    mainWrap.appendChild(leftPanel);
+  }
+
+  // Middle and right placeholders (if future chunks add editors/previews)
+  let middlePanel = qs("#aijr-middle", mainWrap);
+  if (!middlePanel) {
+    middlePanel = el("div", { id: "aijr-middle", style: { flex: "1 1 auto", minWidth: "320px" } });
+    mainWrap.appendChild(middlePanel);
+  }
+  let rightPanel = qs("#aijr-right", mainWrap);
+  if (!rightPanel) {
+    rightPanel = el("div", { id: "aijr-right", style: { width: "360px", minWidth: "240px", flexShrink: "0" } });
+    mainWrap.appendChild(rightPanel);
+  }
+
+  // ---------- CollapseButton component ----------
+  function CollapseButton({ isCollapsed = false, onToggle, direction = "left", title = "Collapse/Expand" } = {}) {
+    const btn = el("button", {
+      class: "collapse-btn",
+      title,
+      onclick: (e) => { e.stopPropagation(); if (onToggle) onToggle(); }
+    }, isCollapsed ? (direction === "left" ? "→" : "←") : (direction === "left" ? "←" : "→"));
+    btn.style.cssText = "width:28px;height:28px;border-radius:6px;background:var(--bg-secondary,#f0f0f0);border:1px solid var(--border-color,#d1d1d1);";
+    return btn;
+  }
+
+  // ---------- Templates (local list) ----------
+  const templates = [
+    { id: "todo", name: "Todo App", icon: "✅", prompt: "A todo app with localStorage, add/edit/delete todos, simple UI." },
+    { id: "notes", name: "Notes App", icon: "📝", prompt: "Notes with markdown preview and autosave to localStorage." },
+    { id: "ai-chat", name: "AI Chat", icon: "🤖", prompt: "A chat UI that sends messages to an AI and displays responses." },
+    { id: "timer", name: "Pomodoro Timer", icon: "⏱️", prompt: "Pomodoro timer with configurable intervals and notifications." },
+  ];
+  window.AIJR.templates = templates;
+
+  // ---------- Templates Modal ----------
+  function openTemplatesModal() {
+    const overlay = el("div", { class: "modal-overlay", onclick: () => closeModal(overlay) });
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999";
+    const box = el("div", { class: "neu-box", onclick: (e) => e.stopPropagation() });
+    box.style.cssText = "background:var(--bg-color,#fff);padding:18px;border-radius:16px;max-width:900px;width:100%;max-height:80vh;overflow:auto;";
+    box.appendChild(el("h3", { style: { marginTop: 0 } }, "🎨 App Templates"));
+    const grid = el("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "12px", marginTop: "12px" } });
+    templates.forEach(t => {
+      const card = el("button", { class: "template-card", onclick: () => { applyTemplate(t); closeModal(overlay); } });
+      card.style.cssText = "display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:12px;border-radius:12px;background:var(--bg-secondary,#f7f7f7);border:1px solid var(--border-color,#ddd);text-align:left";
+      card.appendChild(el("div", { style: { fontSize: "24px" } }, t.icon));
+      card.appendChild(el("div", { style: { fontWeight: 800 } }, t.name));
+      card.appendChild(el("div", { style: { color: "var(--text-secondary,#666)", fontSize: "12px" } }, t.prompt));
+      grid.appendChild(card);
+    });
+    box.appendChild(grid);
+    box.appendChild(el("div", { style: { marginTop: "12px" } }, el("button", { class: "neu-btn-black", onclick: () => closeModal(overlay) }, "Close")));
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  }
+
+  function applyTemplate(tpl) {
+    // If an editor area exists in chunk1 (app.js created none), try to populate it.
+    const promptEl = qs("textarea[placeholder*='Describe your app']") || qs("textarea");
+    if (promptEl) {
+      promptEl.value = tpl.prompt;
+      promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+      pushLog(`Template applied: ${tpl.name}`);
+    } else {
+      // store in temporary area in window.AIJR for next chunk to pick up
+      window.AIJR.pendingTemplate = tpl;
+      pushLog(`Template saved to pendingTemplate: ${tpl.name}`);
+    }
+  }
+
+  // ---------- New File Modal ----------
+  function openNewFileModal() {
+    const overlay = el("div", { class: "modal-overlay", onclick: () => closeModal(overlay) });
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999";
+    const box = el("div", { class: "neu-box", onclick: (e) => e.stopPropagation() });
+    box.style.cssText = "background:var(--bg-color,#fff);padding:18px;border-radius:12px;max-width:420px;width:100%";
+    box.appendChild(el("h3", { style: { marginTop: 0 } }, "Create New File"));
+    const input = el("input", { placeholder: "e.g., styles.css, script.js", style: { width: "100%", padding: "8px", marginTop: "8px" } });
+    box.appendChild(input);
+    const row = el("div", { style: { display: "flex", gap: "8px", marginTop: "12px" } });
+    const cancel = el("button", { class: "neu-btn", onclick: () => closeModal(overlay) }, "Cancel");
+    const create = el("button", { class: "neu-btn-black", onclick: () => { createNewFile(input.value.trim()); closeModal(overlay); } }, "Create");
+    row.appendChild(cancel); row.appendChild(create);
+    box.appendChild(row);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    setTimeout(() => input.focus(), 50);
+  }
+
+  function createNewFile(name) {
+    if (!name) { pushLog("No filename supplied"); return; }
+    const files = JSON.parse(localStorage.getItem("jr_files") || "[]");
+    if (files.some(f => f.name.toLowerCase() === name.toLowerCase())) { pushLog(`File "${name}" already exists`); return; }
+    files.push({ name, content: "" });
+    localStorage.setItem("jr_files", JSON.stringify(files));
+    pushLog(`Created file ${name}`);
+    // signal to other chunks
+    window.AIJR.files = files;
+    if (window.AIJR.onFilesChanged) window.AIJR.onFilesChanged(files);
+  }
+
+  // ---------- UsageBar component ----------
+  function createUsageBar({ slim = false, onRefresh = null } = {}) {
+    const wrap = el("div", { style: { display: "flex", alignItems: "center", gap: "8px" } });
+    const left = el("div", { style: { minWidth: "60px", fontSize: "12px", color: "var(--text-secondary,#666)" } }, "0M");
+    const barWrap = el("div", { style: { flex: "1", height: slim ? "8px" : "18px", background: "var(--bg-secondary,#eee)", borderRadius: "12px", position: "relative", overflow: "hidden" } });
+    const fill = el("div", { style: { width: "20%", height: "100%", background: "var(--accent-color,#0010d9)", transition: "width 600ms ease" } });
+    barWrap.appendChild(fill);
+    const right = el("div", { style: { minWidth: "60px", fontSize: "12px", color: "var(--text-secondary,#666)", textAlign: "right" } }, "0M");
+    const refresh = el("button", { class: "neu-btn", onclick: async () => { await refreshUsage(); if (onRefresh) onRefresh(); } }, "⟳");
+    wrap.appendChild(left); wrap.appendChild(barWrap); wrap.appendChild(right); wrap.appendChild(refresh);
+
+    async function refreshUsage() {
+      pushLog("Refreshing usage (mock)...");
+      // If puter SDK available, attempt getMonthlyUsage
+      if (window.puter && window.puter.auth && typeof window.puter.auth.getMonthlyUsage === "function") {
+        try {
+          const u = await window.puter.auth.getMonthlyUsage();
+          const allowance = u?.allowanceInfo?.monthUsageAllowance || 1000000;
+          const remaining = u?.allowanceInfo?.remaining || allowance * 0.6;
+          const used = allowance - remaining;
+          const pct = Math.min(100, Math.round((used / allowance) * 100));
+          fill.style.width = pct + "%";
+          left.textContent = `${(used / 1e6).toFixed(2)}M`;
+          right.textContent = `${(allowance / 1e6).toFixed(2)}M`;
+          pushLog("Usage updated from Puter");
+        } catch (err) {
+          pushLog("Usage fetch failed: " + (err.message || err));
+        }
+      } else {
+        // Mock / random pulse
+        const pct = Math.floor(Math.random() * 70) + 10;
+        fill.style.width = pct + "%";
+        left.textContent = `${(pct / 100 * 5).toFixed(2)}M`;
+        right.textContent = `5.00M`;
+        pushLog("Usage updated (mock)");
+      }
+    }
+
+    return { node: wrap, refreshUsage };
+  }
+
+  // ---------- Left Panel: Create / Apps UI ----------
+  function buildLeftPanel() {
+    leftPanel.innerHTML = "";
+    // Header with tabs and collapse
+    const header = el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } });
+    const tabs = el("div", { style: { display: "flex", gap: "6px", flex: "1" } });
+    const btnCreate = el("button", { class: "neu-btn", onclick: () => switchLeftTab("create") }, "🔨 Create");
+    const btnApps = el("button", { class: "neu-btn", onclick: () => switchLeftTab("apps") }, "📱 Apps");
+    tabs.appendChild(btnCreate); tabs.appendChild(btnApps);
+    header.appendChild(tabs);
+    const collapse = CollapseButton({ isCollapsed: false, direction: "left", onToggle: () => { leftPanel.classList.toggle("collapsed"); } });
+    header.appendChild(collapse);
+    leftPanel.appendChild(header);
+
+    // Body area
+    const body = el("div", { id: "left-body", style: { marginTop: "12px" } });
+    leftPanel.appendChild(body);
+
+    // default to create
+    switchLeftTab.current = "create";
+    switchLeftTab("create");
+  }
+
+  function switchLeftTab(tab) {
+    const body = qs("#left-body");
+    if (!body) return;
+    body.innerHTML = "";
+    if (tab === "create") {
+      // Template button, model selector placeholder, prompt textarea, build button
+      const chooseTemplate = el("button", { class: "neu-btn", onclick: () => openTemplatesModal() }, "🎨 Choose Template");
+      body.appendChild(chooseTemplate);
+      // Provider & model placeholder
+      body.appendChild(el("div", { style: { marginTop: "10px" } }, el("label", { style: { fontWeight: 700 } }, "Model (" + (settings.activeProvider || "Puter") + ")")));
+      const modelSelect = el("select", { style: { width: "100%", padding: "8px", marginTop: "6px" } });
+      modelSelect.appendChild(el("option", { value: "default" }, "default-model"));
+      body.appendChild(modelSelect);
+      // Prompt textarea
+      const ta = el("textarea", { placeholder: "Describe your app in detail...", style: { width: "100%", height: "90px", marginTop: "8px", padding: "8px" } });
+      // If a pending template exists (from applying template earlier), prefill
+      if (window.AIJR.pendingTemplate) ta.value = window.AIJR.pendingTemplate.prompt;
+      body.appendChild(ta);
+      // name/title inputs
+      const grid = el("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginTop: "8px" } });
+      const inputName = el("input", { placeholder: "my-app", style: { padding: "8px" } });
+      const inputTitle = el("input", { placeholder: "My App", style: { padding: "8px" } });
+      grid.appendChild(inputName); grid.appendChild(inputTitle);
+      body.appendChild(grid);
+      // build footer
+      const footer = el("div", { style: { display: "flex", justifyContent: "space-between", marginTop: "12px", gap: "8px" } });
+      const newBtn = el("button", { class: "neu-btn", onclick: () => { ta.value = ""; inputName.value = ""; inputTitle.value = ""; pushLog("New build form cleared"); } }, "🆕 New");
+      const buildBtn = el("button", { class: "neu-btn-red", onclick: () => { // basic generate stub
+        const prompt = ta.value.trim();
+        if (!prompt) { pushLog("Enter a description before generating"); return; }
+        pushLog("Requesting generation (stub)...");
+        // Save as app in jr_apps (localStorage) as placeholder
+        const apps = JSON.parse(localStorage.getItem("jr_apps") || "[]");
+        const appDoc = {
+          _id: `app_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+          appName: inputName.value.trim() || `app_${Date.now()}`,
+          appTitle: inputTitle.value.trim() || prompt.slice(0,50),
+          prompt,
+          code: "<!doctype html><html><body><h1>Generated App</h1></body></html>",
+          createdAt: Date.now(),
+          version: 1,
+          favorite: false,
+          views: 0,
+        };
+        apps.unshift(appDoc);
+        localStorage.setItem("jr_apps", JSON.stringify(apps));
+        pushLog(`Saved generated app: ${appDoc.appName}`);
+        // refresh apps list if showing
+        if (switchLeftTab.current === "apps") renderAppsList();
+      } }, "🚀 Create & Deploy");
+      footer.appendChild(newBtn); footer.appendChild(buildBtn);
+      body.appendChild(footer);
+    } else if (tab === "apps") {
+      // Apps search/filter and list
+      const search = el("input", { placeholder: "Search apps...", style: { width: "100%", padding: "8px" }, oninput: debounce((e) => renderAppsList(e.target.value), 250) });
+      body.appendChild(search);
+      const actions = el("div", { style: { display: "flex", gap: "8px", marginTop: "8px" } },
+        el("button", { class: "neu-btn", onclick: () => { /* toggle favorites */ pushLog("Toggled favorites filter (stub)"); } }, "⭐ Favorites"),
+        el("button", { class: "neu-btn", onclick: () => { /* bulk */ pushLog("Toggled bulk (stub)"); } }, "☑️ Select")
+      );
+      body.appendChild(actions);
+      const listWrap = el("div", { id: "apps-list", style: { marginTop: "12px", maxHeight: "360px", overflow: "auto" } });
+      body.appendChild(listWrap);
+      renderAppsList();
+    }
+    switchLeftTab.current = tab;
+  }
+
+  function renderAppsList(query = "") {
+    const wrap = qs("#apps-list");
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    const apps = JSON.parse(localStorage.getItem("jr_apps") || "[]");
+    const filtered = (apps || []).filter(a => {
+      if (!query) return true;
+      const q = query.toLowerCase();
+      return (a.appName || "").toLowerCase().includes(q) || (a.appTitle || "").toLowerCase().includes(q) || (a.prompt || "").toLowerCase().includes(q);
+    });
+    if (!filtered.length) {
+      wrap.appendChild(el("div", { style: { color: "var(--text-secondary,#666)", padding: "12px" } }, "No apps"));
+      return;
+    }
+    filtered.forEach(app => {
+      const row = el("div", { style: { padding: "10px", borderBottom: "1px solid var(--border-color,#e1e1e1)", cursor: "pointer" }, onclick: () => { pushLog(`Opened ${app.appName}`); window.AIJR.selectedApp = app; if (window.AIJR.onAppSelected) window.AIJR.onAppSelected(app); } });
+      row.appendChild(el("div", { style: { fontWeight: 800 } }, app.appTitle || app.appName));
+      row.appendChild(el("div", { style: { color: "var(--text-secondary,#666)", fontSize: "12px" } }, (app.prompt || "").slice(0, 80)));
+      const actions = el("div", { style: { marginTop: "8px", display: "flex", gap: "8px" } });
+      actions.appendChild(el("button", { class: "neu-btn", onclick: (e) => { e.stopPropagation(); toggleFavoriteLocalApp(app._id); } }, app.favorite ? "★" : "☆"));
+      actions.appendChild(el("button", { class: "neu-btn", onclick: (e) => { e.stopPropagation(); launchLocalApp(app._id); } }, "▶"));
+      actions.appendChild(el("button", { class: "neu-btn", onclick: (e) => { e.stopPropagation(); exportSingleAppLocal(app._id); } }, "📤"));
+      row.appendChild(actions);
+      wrap.appendChild(row);
+    });
+  }
+
+  function toggleFavoriteLocalApp(appId) {
+    const apps = JSON.parse(localStorage.getItem("jr_apps") || "[]");
+    const idx = apps.findIndex(a => a._id === appId);
+    if (idx >= 0) {
+      apps[idx].favorite = !apps[idx].favorite;
+      localStorage.setItem("jr_apps", JSON.stringify(apps));
+      pushLog(`${apps[idx].appName} favorite: ${apps[idx].favorite}`);
+      renderAppsList();
+    }
+  }
+
+  function launchLocalApp(appId) {
+    const apps = JSON.parse(localStorage.getItem("jr_apps") || "[]");
+    const app = apps.find(a => a._id === appId);
+    if (!app) return;
+    app.views = (app.views || 0) + 1;
+    localStorage.setItem("jr_apps", JSON.stringify(apps));
+    // open preview blob
+    const blob = new Blob([app.code || ""], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank");
+    pushLog(`Launched ${app.appName}`);
+  }
+
+  function exportSingleAppLocal(appId) {
+    const apps = JSON.parse(localStorage.getItem("jr_apps") || "[]");
+    const app = apps.find(a => a._id === appId);
+    if (!app) return;
+    const data = JSON.stringify(app, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = el("a", { href: url, download: `${app.appName || 'app'}-export.json` });
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    pushLog(`Exported ${app.appName}`);
+  }
+
+  function closeModal(overlay) {
+    if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+  }
+
+  // Expose hooks for later chunks
+  window.AIJR.openTemplatesModal = openTemplatesModal;
+  window.AIJR.openNewFileModal = openNewFileModal;
+  window.AIJR.createNewFile = createNewFile;
+  window.AIJR.renderAppsList = renderAppsList;
+
+  // Build left panel now
+  buildLeftPanel();
+
+  // Add a small usage bar to header area if present
+  const header = qs(".app-header") || container.querySelector("div");
+  if (header) {
+    const usageArea = el("div", { style: { marginLeft: "12px", display: "inline-block" } });
+    const usage = createUsageBar({ slim: true, onRefresh: () => pushLog("Usage refreshed") });
+    usageArea.appendChild(usage.node);
+    header.appendChild(usageArea);
+    // initial refresh
+    usage.refreshUsage();
+  }
+
+  // Provide simple UI feedback
+  pushLog("Chunk 2 loaded: Templates, New File, CollapseButton, UsageBar, Left Panel");
+
+})();
