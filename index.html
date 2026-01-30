@@ -3,9 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI JR App Builder</title>
-  <!-- Reuse the repository styles.css (place it next to these files) -->
+  <title>AI JR App Builder — Vanilla (no-build)</title>
+  <!-- Repo styles -->
   <link rel="stylesheet" href="./styles.css" />
+  <!-- CodeMirror 5 (browser-friendly, no build) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css" integrity="sha512-ZoGdFWo3t2V8u9rrm8s3A+KXMi6Y3D0rps2q2Vw7pC1fYdQkb3Z0sQxW8hDx7TJ8n4p3hrrzQqk8V4x3n9rQ1w==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js" integrity="sha512-X3y0Yt0NIQqJtW5P1x7p7fCNo2v5f4Z0QhR0qg3Qp0Yw0E8LJ1k8eC8c7m0h5P3uM0g2Qp4c5r6s7t8u9v0w==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/xml/xml.min.js" integrity="sha512-5u+gRkqN7Q+Z7kZ+6lQ6Zy7q1pZbH3lXxV9m1h2sP0R6gS5s2K1F4bJ8eNqKZ1y0H6wY7r3v5v0w1y2z3a4b==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/javascript/javascript.min.js" integrity="sha512-VP9y8XJ2mJ2p5u3Vw6g2A+Kqf8d6x3b1y3u7p0v6g8Q2w9r1t4k5n0p7s3z7y1w2b6c9d0f3z4v5x6b7c8d9==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/css/css.min.js" integrity="sha512-9s7fV6a6q1s9r3v4b2x6l9p1t8w3y5z0v2a9b1c7d8e6f3g2h0j1k8l4m5n6o7p8q9r0s1t2u3v4w5x6y7z8==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/htmlmixed/htmlmixed.min.js" integrity="sha512-Ap3hK1s4v8c6Y2d1m9Z0c7g5b4n1x8q7w3v0t5s2r6p9y3k4h7b2c6d9e1f0g3h5j8k2l1n6m7o8p3q4r5s6t==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
   <style>
     /* Minimal layout helpers for the bootstrap shell */
     body { height: 100vh; display: flex; flex-direction: column; }
@@ -35,7 +43,6 @@
     /* middle panel should expand */
     #editor-panel { flex: 1 1 auto; min-width: 200px; }
 
-    /* resizers already styled in styles.css; ensure they sit between panels */
     .panel-resizer { width: 8px; display: flex; align-items: center; justify-content: center; cursor: col-resize; }
 
     .panel-header {
@@ -58,11 +65,22 @@
       border-radius:6px;
     }
 
-    /* Small visual placeholders */
-    .placeholder {
+    .placeholder { padding: 12px; color: var(--text-secondary, #666); }
+
+    /* simple modal styling used by vanilla app */
+    .va-modal-overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.45);
+      z-index: 9999;
       padding: 12px;
-      color: var(--text-secondary, #666);
     }
+    .va-modal { background: var(--bg-color); border-radius: 16px; padding: 16px; max-width: 920px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+    .va-modal .grid-templates { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; }
+    .cm-editor { height: 100%; }
   </style>
 </head>
 <body class="theme-light">
@@ -91,8 +109,8 @@
         <span>Create / Apps</span>
         <button class="collapse-btn" data-target="left-panel" title="Collapse/Expand">≡</button>
       </div>
-      <div class="placeholder">
-        Left panel content goes here — templates, provider, model selector, prompt input, Create button...
+      <div id="left-content" class="placeholder">
+        Left panel content — will be rendered by the app.
       </div>
     </aside>
 
@@ -103,8 +121,8 @@
         <span>Editor</span>
         <button class="collapse-btn" id="new-file-btn" title="New file">＋</button>
       </div>
-      <div class="placeholder">
-        Editor area — Monaco/CodeMirror integration will be added later.
+      <div id="editor-area" class="placeholder" style="height:100%;padding:0;">
+        Editor area — loading CodeMirror...
       </div>
     </section>
 
@@ -115,13 +133,13 @@
         <span>Preview</span>
         <button class="collapse-btn" data-target="right-panel" title="Collapse/Expand">≡</button>
       </div>
-      <div class="placeholder">
-        Live preview / run output goes here.
+      <div id="right-content" class="placeholder">
+        Live preview / run output.
       </div>
     </aside>
   </main>
 
+  <!-- app bootstrap -->
   <script type="module" src="./main.js"></script>
 </body>
 </html>
-
