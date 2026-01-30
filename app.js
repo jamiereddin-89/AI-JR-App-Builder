@@ -1,1280 +1,948 @@
-/* Vanilla JS conversion of features from script.jsx (lines 900+) into app.js
-   - Assumes styles.css is loaded and there's a <div id="container"></div> in HTML.
-   - Provides:
-     * 3-panel layout (left: AI / apps, middle: editor & files, right: preview)
-     * Templates, Settings, Export/Import, Share, Versions modals
-     * Local persistence via localStorage for apps, versions, settings, apiKeys
-     * Basic Puter / Pollinations integration (best-effort, graceful fallback)
-     * Resizable panels, collapsible panels
-     * Simple textarea editor (replaceable with Monaco later)
-     * Multi-file tabs
-     * Usage bar (calls puter.auth.getMonthlyUsage if available)
-*/
+// app.js — Feature-complete vanilla app script
+// - Browser-only (no build)
+// - Uses CodeMirror 5 (loaded via index.html)
+// - Attempts to use Fireproof if available; otherwise falls back to localStorage
+// - Adds: formatting, autosave & versions, improved export/import UI, enhanced Settings modal,
+//   accessibility improvements, and keyboard shortcuts.
+// NOTE: This single file is self-contained and intended to replace the previous app.js.
 
-(function () {
+export async function initApp(opts = {}) {
+  const {
+    leftContentId = 'left-content',
+    editorAreaId = 'editor-area',
+    rightContentId = 'right-content',
+    newFileBtnId = 'new-file-btn',
+  } = opts;
+
   // ---------- Utilities ----------
-  function el(tag, attrs = {}, ...children) {
-    const node = document.createElement(tag);
-    for (const [k, v] of Object.entries(attrs)) {
-      if (k === "class") node.className = v;
-      else if (k === "style" && typeof v === "object") {
-        Object.assign(node.style, v);
-      } else if (k.startsWith("on") && typeof v === "function") {
-        node.addEventListener(k.slice(2), v);
-      } else if (k === "html") {
-        node.innerHTML = v;
-      } else {
-        node.setAttribute(k, v);
-      }
+  const el = (tag, attrs = {}, children = []) => {
+    const d = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === 'class') d.className = v;
+      else if (k === 'html') d.innerHTML = v;
+      else if (k === 'style') d.style.cssText = v;
+      else if (k === 'aria') {
+        for (const [ak, av] of Object.entries(v)) d.setAttribute(`aria-${ak}`, av);
+      } else if (k.startsWith('on') && typeof v === 'function') d.addEventListener(k.slice(2).toLowerCase(), v);
+      else d.setAttribute(k, v);
     }
-    for (const c of children) {
-      if (c == null) continue;
-      if (typeof c === "string" || typeof c === "number")
-        node.appendChild(document.createTextNode(String(c)));
-      else node.appendChild(c);
-    }
-    return node;
-  }
-
-  function qs(sel, from = document) {
-    return from.querySelector(sel);
-  }
-
-  function qsa(sel, from = document) {
-    return Array.from(from.querySelectorAll(sel));
-  }
-
-  function saveJSON(key, obj) {
-    localStorage.setItem(key, JSON.stringify(obj));
-  }
-  function loadJSON(key, fallback) {
-    const v = localStorage.getItem(key);
-    if (!v) return fallback;
-    try {
-      return JSON.parse(v);
-    } catch {
-      return fallback;
-    }
-  }
-
-  function uid(prefix = "") {
-    return prefix + Math.random().toString(36).slice(2, 9);
-  }
-
-  // ---------- Persistence (localStorage DB emulation) ----------
-  const DB_APPS = "jr_apps_v1";
-  const DB_VERSIONS = "jr_versions_v1";
-  const DB_SETTINGS = "jr_settings_v1";
-  function getApps() {
-    return loadJSON(DB_APPS, []);
-  }
-  function putApp(app) {
-    const apps = getApps();
-    const idx = apps.findIndex((a) => a._id === app._id);
-    if (idx >= 0) apps[idx] = app;
-    else apps.unshift(app);
-    saveJSON(DB_APPS, apps);
-    return app;
-  }
-  function delApp(appId) {
-    const apps = getApps().filter((a) => a._id !== appId);
-    saveJSON(DB_APPS, apps);
-  }
-  function getVersions() {
-    return loadJSON(DB_VERSIONS, []);
-  }
-  function addVersion(v) {
-    const versions = getVersions();
-    versions.unshift(v);
-    saveJSON(DB_VERSIONS, versions);
-  }
-
-  function getSettings() {
-    return loadJSON(DB_SETTINGS, {
-      appTheme: localStorage.getItem("app-theme") || "light",
-      appLayout: localStorage.getItem("app-layout") || "side-by-side",
-      leftPanelWidth: Number(localStorage.getItem("leftPanelWidth") || 25),
-      codePanelWidth: Number(localStorage.getItem("codePanelWidth") || 42),
-      activeProvider: localStorage.getItem("activeProvider") || "Puter",
-      apiKeys: loadJSON("apiKeys", {}),
-      favoriteModels: loadJSON("favoriteModels", []),
+    (Array.isArray(children) ? children : [children]).forEach(c => {
+      if (c == null) return;
+      if (typeof c === 'string') d.appendChild(document.createTextNode(c));
+      else d.appendChild(c);
     });
-  }
-  function saveSettings(s) {
-    saveJSON(DB_SETTINGS, s);
-    localStorage.setItem("app-theme", s.appTheme);
-    localStorage.setItem("app-layout", s.appLayout);
-    localStorage.setItem("leftPanelWidth", s.leftPanelWidth);
-    localStorage.setItem("codePanelWidth", s.codePanelWidth);
-    localStorage.setItem("activeProvider", s.activeProvider);
-    saveJSON("apiKeys", s.apiKeys || {});
-    saveJSON("favoriteModels", s.favoriteModels || []);
-  }
-
-  // ---------- Initial state ----------
-  const state = {
-    apps: getApps(), // array of app docs
-    versions: getVersions(), // array of versions
-    settings: getSettings(),
-    puter: null,
-    user: null,
-    models: [],
-    pollinationsModels: [],
-    templates: [
-      { id: "todo", name: "Todo App", icon: "✅", prompt: "A beautiful todo app..." },
-      { id: "calculator", name: "Calculator", icon: "🔢", prompt: "A scientific calculator..." },
-      { id: "notes", name: "Notes App", icon: "����", prompt: "A notes app with markdown support..." },
-      // ... keep a subset for brevity; you can expand
-    ],
-    files: [{ name: "index.html", content: "" }],
-    activeFile: "index.html",
-    editCode: "",
-    selectedAppId: null,
-    generating: false,
-    log: [],
-    ui: {
-      leftCollapsed: false,
-      codeCollapsed: false,
-      previewCollapsed: false,
-      leftPanelWidth: state?.settings?.leftPanelWidth || 25,
-      codePanelWidth: state?.settings?.codePanelWidth || 42,
-    },
+    return d;
   };
 
-  // Ensure settings values are mapped to state.ui
-  state.ui.leftPanelWidth = state.settings.leftPanelWidth || state.ui.leftPanelWidth;
-  state.ui.codePanelWidth = state.settings.codePanelWidth || state.ui.codePanelWidth;
+  const cn = (...parts) => parts.filter(Boolean).join(' ');
+  const debounce = (fn, ms = 300) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  const escapeHtml = s => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  const stripFenced = s => s.replace(/```(?:html|HTML)?\n?/g, '').replace(/```\n?/g, '').trim();
 
-  // ---------- Logging helper ----------
-  function addLog(msg) {
-    const now = new Date().toLocaleTimeString();
-    state.log = [...state.log.slice(-14), `${now}: ${msg}`];
-    renderLog();
-  }
-
-  // ---------- DOM construction ----------
-  const container = document.getElementById("container") || document.body;
-  container.innerHTML = ""; // clear
-  container.classList.add("min-h-screen");
-
-  // Header
-  const headerWrapper = el("div", { class: "max-w-7xl mx-auto p-4 md:p-6" });
-  container.appendChild(headerWrapper);
-
-  const header = el("div", { class: "neu-box rounded-[20px] p-3 flex items-center justify-between gap-4" });
-  headerWrapper.appendChild(header);
-
-  const title = el("div", { class: "flex items-center gap-4" },
-    el("h1", { class: "text-xl font-black" }, "🖥️ JR AI Coder"),
-    el("div", { class: "hidden md:flex flex-col border-l pl-4" },
-      el("div", { class: "text-xs text-[#666] font-bold" }, state.settings.activeProvider || "Puter"),
-      el("div", { class: "text-[10px] text-[#888]" }, `${state.models.length} models • ${state.apps.length} apps`)
-    )
-  );
-  header.appendChild(title);
-
-  // UsageBar placeholder
-  const usageContainer = el("div", { style: { flex: "1", maxWidth: "480px", margin: "0 12px" } });
-  header.appendChild(usageContainer);
-
-  // Controls
-  const controls = el("div", { class: "flex items-center gap-2" });
-  header.appendChild(controls);
-
-  const settingsBtn = el("button", { class: "neu-btn p-2 rounded-lg", title: "Settings", onclick: () => openSettings() }, "⚙️");
-  controls.appendChild(settingsBtn);
-
-  const exportBtn = el("button", { class: "neu-btn rounded-lg px-3 py-1.5", onclick: () => openExportImport() }, "📦");
-  controls.appendChild(exportBtn);
-
-  const analyticsBtn = el("button", { class: "neu-btn rounded-lg px-3 py-1.5", onclick: () => toggleAnalytics() }, "📊");
-  controls.appendChild(analyticsBtn);
-
-  const userBlock = el("div", { class: "neu-inset rounded-lg px-3 py-1.5" }, "Guest");
-  controls.appendChild(userBlock);
-
-  // Main 3-panel container
-  const main = el("div", { class: "flex gap-0 mt-6", style: { minHeight: "600px" } });
-  headerWrapper.appendChild(main);
-
-  // Left panel (AI / Apps)
-  const leftPanel = el("div", {
-    class: "transition-all duration-300",
-    style: {
-      width: `${state.ui.leftPanelWidth}%`,
-      minWidth: "200px",
-      flexShrink: "0",
-    },
-  });
-  main.appendChild(leftPanel);
-
-  // Left header with tabs
-  const leftHeader = el("div", { class: "neu-box rounded-[24px] p-2 flex gap-2 items-center" });
-  leftPanel.appendChild(leftHeader);
-
-  const tabCreate = el("button", { class: "flex-1 py-2 rounded-xl font-bold text-xs", onclick: () => switchLeftTab("build") }, "🔨 Create");
-  const tabApps = el("button", { class: "flex-1 py-2 rounded-xl font-bold text-xs", onclick: () => switchLeftTab("apps") }, "📱 Apps");
-  leftHeader.appendChild(tabCreate);
-  leftHeader.appendChild(tabApps);
-
-  const collapseLeftBtn = el("button", { class: "collapse-btn w-6 h-6 rounded-md", onclick: () => toggleLeftCollapse() }, "←");
-  leftHeader.appendChild(collapseLeftBtn);
-
-  // Left content
-  const leftContent = el("div", { class: "mt-3 space-y-4" });
-  leftPanel.appendChild(leftContent);
-
-  // Build card
-  const buildCard = el("div", { class: "neu-box rounded-[24px] p-4" });
-  leftContent.appendChild(buildCard);
-
-  const templateBtn = el("button", { class: "neu-btn w-full rounded-xl py-2 font-bold", onclick: () => openTemplates() }, "🎨 Choose Template");
-  buildCard.appendChild(templateBtn);
-
-  // Model select
-  const modelLabel = el("label", { class: "text-[10px] font-black block mt-3" }, `Model (${state.settings.activeProvider})`);
-  buildCard.appendChild(modelLabel);
-  const modelSelectWrap = el("div", { class: "neu-inset rounded-xl p-1 mt-1" });
-  buildCard.appendChild(modelSelectWrap);
-  const modelSelect = el("select", { class: "w-full p-2 bg-transparent font-mono text-[10px]" });
-  modelSelectWrap.appendChild(modelSelect);
-
-  // Prompt textarea
-  const promptLabel = el("label", { class: "font-black text-[#dc2626] text-[10px] uppercase mt-3 block" }, "App Description");
-  buildCard.appendChild(promptLabel);
-  const promptAreaWrap = el("div", { class: "neu-inset rounded-xl p-1 mt-1" });
-  buildCard.appendChild(promptAreaWrap);
-  const promptArea = el("textarea", { class: "w-full h-20 p-2 bg-transparent font-mono text-xs resize-none", placeholder: "Describe your app..." });
-  promptAreaWrap.appendChild(promptArea);
-
-  // App name / title
-  const nameGrid = el("div", { class: "grid grid-cols-2 gap-2 mt-3" });
-  const inputAppName = el("input", { placeholder: "my-app", class: "w-full p-1.5 bg-transparent text-xs" });
-  const inputAppTitle = el("input", { placeholder: "My App", class: "w-full p-1.5 bg-transparent text-xs" });
-  nameGrid.appendChild(el("div", {}, el("label", { class: "text-[10px] font-black block" }, "App Name"), el("div", { class: "neu-inset rounded-lg p-1" }, inputAppName)));
-  nameGrid.appendChild(el("div", {}, el("label", { class: "text-[10px] font-black block" }, "Title"), el("div", { class: "neu-inset rounded-lg p-1" }, inputAppTitle)));
-  buildCard.appendChild(nameGrid);
-
-  // Footer actions
-  const buildFooter = el("div", { class: "neu-inset rounded-xl p-2 flex items-center justify-between mt-3" },
-    el("span", { class: "text-xs text-[#666]" }, "New App"),
-    el("div", { class: "flex gap-2" },
-      el("button", { class: "neu-btn rounded-lg px-3 py-1.5", onclick: () => resetBuild() }, "🆕 New"),
-      el("button", { class: "neu-btn-red rounded-lg px-4 py-1.5", onclick: () => buildAndDeploy(), id: "createBtn" }, "🚀 Create & Deploy")
-    )
-  );
-  buildCard.appendChild(buildFooter);
-
-  // Apps tab content
-  const appsCard = el("div", { class: "neu-box rounded-[24px] overflow-hidden", style: { display: "none" } });
-  leftContent.appendChild(appsCard);
-
-  const appsSearch = el("div", { class: "p-4 space-y-3" },
-    el("div", { class: "neu-inset rounded-xl p-1 flex items-center" },
-      el("span", { class: "pl-3 text-[#999]" }, "🔍"),
-      el("input", { placeholder: "Search apps...", class: "flex-1 p-2 bg-transparent text-sm", id: "appsSearchInput" })
-    ),
-    el("div", { class: "flex gap-2" },
-      el("button", { class: "neu-btn px-3 py-1.5", onclick: () => toggleFilterFavorites() }, "⭐ Favorites"),
-      el("select", { class: "neu-btn rounded-full px-3 py-1.5", onchange: (e) => setSortBy(e.target.value) },
-        el("option", { value: "date" }, "Recent"),
-        el("option", { value: "name" }, "Name"),
-        el("option", { value: "views" }, "Views")
-      ),
-      el("button", { class: "neu-btn px-3 py-1.5", onclick: () => toggleBulkMode() }, "☑️ Select")
-    )
-  );
-  appsCard.appendChild(appsSearch);
-
-  const appsListWrap = el("div", { class: "max-h-96 overflow-y-auto", id: "appsList" });
-  appsCard.appendChild(appsListWrap);
-
-  // Log panel
-  const logWrap = el("div", { id: "logWrap", class: "mt-4" });
-  leftContent.appendChild(logWrap);
-
-  // Resizer between left and middle
-  const resizerLeft = el("div", { class: "panel-resizer hidden lg:flex", title: "Resize panels" });
-  main.appendChild(resizerLeft);
-
-  // Middle panel (code editor)
-  const middlePanel = el("div", {
-    class: "space-y-4 transition-all duration-300",
-    style: {
-      width: `${state.ui.codePanelWidth}%`,
-      minWidth: "300px",
-      flexShrink: "0",
-    },
-  });
-  main.appendChild(middlePanel);
-
-  // Code panel header
-  const codePanel = el("div", { class: "neu-box rounded-[24px] overflow-hidden h-full" });
-  middlePanel.appendChild(codePanel);
-  const codePanelHeader = el("div", { class: "p-2 flex items-center justify-between" });
-  codePanel.appendChild(codePanelHeader);
-
-  const codeLeftHeader = el("div", { class: "flex items-center gap-1" },
-    el("button", { class: "collapse-btn w-6 h-6", onclick: () => toggleCodeCollapse() }, "←"),
-    el("span", { class: "font-bold" }, "Code"),
-    el("div", { class: "flex gap-1 items-center overflow-x-auto", id: "fileTabs" })
-  );
-  codePanelHeader.appendChild(codeLeftHeader);
-
-  const codeHeaderRight = el("div", { class: "flex gap-1" },
-    el("button", { class: "neu-btn", onclick: () => copyCode() }, "📋 Copy"),
-    el("button", { class: "neu-btn", onclick: () => formatCode() }, "✨ Format"),
-    el("button", { class: "neu-btn-red", id: "saveDeployBtn", onclick: () => updateAndRedeploy(), style: { display: "none" } }, "Save & Deploy")
-  );
-  codePanelHeader.appendChild(codeHeaderRight);
-
-  // Editor area (simple textarea editor)
-  const editorWrap = el("div", { class: "h-[520px] bg-white relative" });
-  const editorArea = el("textarea", { class: "w-full h-full p-3 font-mono text-sm", id: "codeEditor", placeholder: "<!DOCTYPE html> ... " });
-  editorWrap.appendChild(editorArea);
-  const charCount = el("div", { class: "absolute bottom-2 right-2 text-[#666] text-xs bg-black/5 px-1 rounded" }, "0 chars");
-  editorWrap.appendChild(charCount);
-  codePanel.appendChild(editorWrap);
-
-  // Resizer between middle and right
-  const resizerRight = el("div", { class: "panel-resizer hidden lg:flex", title: "Resize panels" });
-  main.appendChild(resizerRight);
-
-  // Right panel (preview)
-  const rightPanel = el("div", { class: "space-y-4 transition-all duration-300 flex-1", style: { minWidth: "250px" } });
-  main.appendChild(rightPanel);
-
-  const previewCard = el("div", { class: "neu-box rounded-[24px] overflow-hidden h-full" });
-  rightPanel.appendChild(previewCard);
-
-  const previewHeader = el("div", { class: "p-2 flex items-center justify-between" },
-    el("div", { class: "flex items-center gap-2" },
-      el("button", { class: "collapse-btn w-6 h-6", onclick: () => togglePreviewCollapse() }, "→"),
-      el("span", { class: "font-bold" }, "Preview")
-    ),
-    el("div", { class: "flex gap-1" },
-      el("button", { class: "neu-btn", onclick: () => openVersions() }, "📚"),
-      el("button", { class: "neu-btn", onclick: () => openShare() }, "🔗"),
-      el("button", { class: "neu-btn", onclick: () => exportCurrentApp() }, "📤"),
-      el("button", { class: "neu-btn", onclick: () => openInNewTab() }, "🔗 Open"),
-      el("button", { class: "neu-btn-red", onclick: () => runPreview() }, "▶ Run")
-    )
-  );
-  previewCard.appendChild(previewHeader);
-
-  const previewArea = el("div", { class: "h-[520px] bg-white" },
-    el("iframe", { class: "w-full h-full border-0", sandbox: "allow-scripts allow-forms allow-modals allow-popups", id: "previewIframe", title: "App Preview" })
-  );
-  previewCard.appendChild(previewArea);
-
-  const appDetailsWrap = el("div", { class: "p-3 border-t" , id: "appDetails" });
-  previewCard.appendChild(appDetailsWrap);
-
-  // Footer
-  const footer = el("div", { class: "text-center py-4" },
-    el("div", { class: "inline-flex items-center gap-2 text-[#888] text-sm" },
-      el("span", { class: "w-2 h-2 rounded-full bg-[#dc2626]" }),
-      el("span", {}, "Powered by Puter.com || Version 1.5.0")
-    )
-  );
-  container.appendChild(footer);
-
-  // ---------- Modal overlays (single container reused) ----------
-  const overlayRoot = el("div", { id: "modalRoot" });
-  document.body.appendChild(overlayRoot);
-
-  function showModal(node) {
-    overlayRoot.innerHTML = "";
-    overlayRoot.appendChild(node);
-  }
-  function closeModal() {
-    overlayRoot.innerHTML = "";
-  }
-
-  // ---------- Rendering helpers ----------
-  function renderLog() {
-    logWrap.innerHTML = "";
-    if (!state.log.length) return;
-    const box = el("div", { class: "log-panel rounded-2xl p-4 neu-inset" },
-      el("div", { class: "text-[#666] font-mono text-xs space-y-1 max-h-32 overflow-y-auto" },
-        ...state.log.map(l => el("div", { class: l.includes("✅") ? "text-green-600" : l.includes("❌") ? "text-red-600" : "" }, l))
-      )
-    );
-    logWrap.appendChild(box);
-  }
-
-  function rerenderAppsList() {
-    appsListWrap.innerHTML = "";
-    const apps = state.apps || [];
-    if (!apps.length) {
-      appsListWrap.appendChild(el("div", { class: "p-6 text-[#888] text-center" }, "No apps yet"));
-      return;
+  // ---------- Local store ----------
+  const State = (function () {
+    const defaultFiles = [{ name: 'index.html', content: '<!doctype html>\n<html>\n<head>\n<meta charset="utf-8"><title>New App</title>\n</head>\n<body>\n<h1>Hello</h1>\n</body>\n</html>' }];
+    let s = {
+      theme: localStorage.getItem('app-theme') || 'light',
+      activeProvider: localStorage.getItem('activeProvider') || 'Puter',
+      apiKeys: JSON.parse(localStorage.getItem('apiKeys') || '{}'),
+      favoriteModels: new Set(JSON.parse(localStorage.getItem('favoriteModels') || '[]')),
+      files: JSON.parse(localStorage.getItem('va_files') || JSON.stringify(defaultFiles)),
+      activeFile: (JSON.parse(localStorage.getItem('va_files') || JSON.stringify(defaultFiles))[0] || defaultFiles[0]).name,
+      templates: [],
+      apps: [],
+      versions: [],
+      pollinationsModels: [],
+      logs: [],
+      usage: null,
+      layout: localStorage.getItem('app-layout') || 'side-by-side',
+    };
+    const subs = new Set();
+    function notify() { subs.forEach(cb => cb(get())); }
+    function get() {
+      return {
+        ...s,
+        favoriteModels: new Set([...s.favoriteModels]),
+        files: JSON.parse(JSON.stringify(s.files)),
+      };
     }
-    for (const app of apps) {
-      const appEl = el("div", {
-        class: "p-4 border-b cursor-pointer",
-        onclick: () => {
-          selectApp(app._id);
-        },
-      },
-        el("div", { class: "font-black" }, `${app.appTitle || app.appName} ${app.favorite ? "⭐" : ""}`),
-        el("div", { class: "text-xs text-[#666]" }, `v${app.version || 1} • 👁️ ${app.views || 0}`),
-        el("div", { class: "text-xs text-[#666] truncate" }, app.prompt || "")
-      );
-      appsListWrap.appendChild(appEl);
+    function set(partial) {
+      Object.assign(s, partial);
+      if (partial.apiKeys) localStorage.setItem('apiKeys', JSON.stringify(s.apiKeys));
+      if (partial.activeProvider) localStorage.setItem('activeProvider', s.activeProvider);
+      if (partial.theme) { localStorage.setItem('app-theme', s.theme); document.body.className = `theme-${s.theme}`; }
+      if (partial.favoriteModels) localStorage.setItem('favoriteModels', JSON.stringify([...s.favoriteModels]));
+      if (partial.files) localStorage.setItem('va_files', JSON.stringify(s.files));
+      if (partial.layout) localStorage.setItem('app-layout', s.layout);
+      notify();
     }
-  }
+    function subscribe(cb) { subs.add(cb); return () => subs.delete(cb); }
+    function updateFiles(newFiles) { s.files = newFiles; localStorage.setItem('va_files', JSON.stringify(s.files)); if (!s.files.find(f => f.name === s.activeFile)) s.activeFile = s.files[0]?.name || ''; notify(); }
+    function setActiveFile(name) { s.activeFile = name; notify(); }
+    function addFile(file) { s.files.push(file); s.activeFile = file.name; localStorage.setItem('va_files', JSON.stringify(s.files)); notify(); }
+    function deleteFile(name) { s.files = s.files.filter(f => f.name !== name); if (s.activeFile === name) s.activeFile = s.files[0]?.name || ''; localStorage.setItem('va_files', JSON.stringify(s.files)); notify(); }
+    function toggleFavoriteModel(id) { if (s.favoriteModels.has(id)) s.favoriteModels.delete(id); else s.favoriteModels.add(id); set({ favoriteModels: s.favoriteModels }); }
+    function pushLog(msg) { s.logs = [...s.logs.slice(-14), `${new Date().toLocaleTimeString()}: ${msg}`]; notify(); }
+    return { get, set, subscribe, updateFiles, setActiveFile, addFile, deleteFile, toggleFavoriteModel, pushLog };
+  })();
 
-  function renderFileTabs() {
-    const tabs = qs("#fileTabs");
-    tabs.innerHTML = "";
-    for (const f of state.files) {
-      const btn = el("div", { class: "relative group inline-block mr-1" },
-        el("button", {
-          class: `px-3 py-1.5 rounded-lg text-xs ${state.activeFile === f.name ? "neu-inset" : "neu-btn"}`,
-          onclick: () => {
-            state.activeFile = f.name;
-            editorArea.value = f.content;
-            updateUI();
-          }
-        }, f.name),
-        state.files.length > 1 ? el("button", {
-          class: "absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100",
-          onclick: (e) => {
-            e.stopPropagation();
-            deleteFile(f.name);
-          }
-        }, "×") : null
-      );
-      tabs.appendChild(btn);
-    }
-    const addBtn = el("button", { class: "neu-btn rounded-lg w-7 h-7", onclick: () => openNewFileModal() }, "+");
-    tabs.appendChild(addBtn);
-  }
-
-  function renderEditorCharCount() {
-    charCount.textContent = `${(editorArea.value || "").length} chars`;
-  }
-
-  function renderPreview() {
-    const iframe = qs("#previewIframe");
-    const code = state.editCode || (getSelectedApp() && getSelectedApp().code) || "";
-    if (code) {
-      iframe.srcdoc = code;
-    } else {
-      iframe.srcdoc = "<!doctype html><html><body style='display:flex;align-items:center;justify-content:center;height:100%'><div style='text-align:center;color:#888'>LIVE PREVIEW<br/>Build or select an app</div></body></html>";
-    }
-  }
-
-  function renderAppDetails() {
-    const wrap = appDetailsWrap;
-    wrap.innerHTML = "";
-    const sel = getSelectedApp();
-    if (!sel) return;
-    const details = el("div", { class: "flex items-center justify-between" },
-      el("div", { class: "min-w-0 flex-1" },
-        el("div", { class: "font-bold text-xs" }, `${sel.appTitle || sel.appName} ${sel.favorite ? "⭐" : ""}`),
-        el("div", { class: "text-[#666] text-[10px]" }, `v${sel.version || 1} • 👁️ ${sel.views || 0} • ${sel.model || ""}`)
-      ),
-      el("div", { class: "flex gap-1" },
-        el("button", { class: "neu-btn rounded-lg w-7 h-7", onclick: (e) => { e.stopPropagation(); toggleFavoriteApp(sel._id); } }, sel.favorite ? "⭐" : "☆"),
-        el("button", { class: "neu-btn-black rounded-lg px-2 py-1", onclick: (e) => { e.stopPropagation(); launchApp(sel._id); } }, "Launch"),
-        el("button", { class: "neu-btn rounded-lg w-7 h-7", onclick: (e) => { e.stopPropagation(); deleteAppHandler(sel._id); } }, "🗑️")
-      )
-    );
-    wrap.appendChild(details);
-  }
-
-  function updateUI() {
-    // update panels sizes
-    leftPanel.style.width = state.ui.leftCollapsed ? "50px" : `${state.ui.leftPanelWidth}%`;
-    middlePanel.style.width = state.ui.codeCollapsed ? "50px" : `${state.ui.codePanelWidth}%`;
-    // header user
-    userBlock.textContent = state.user ? `👤 ${state.user.username}` : "Guest";
-    // model select
-    modelSelect.innerHTML = "";
-    const models = (state.pollinationsModels.length && state.settings.activeProvider === "Pollinations")
-      ? state.pollinationsModels
-      : state.models;
-    if ((state.settings.favoriteModels || []).length) {
-      const favs = models.filter(m => (state.settings.favoriteModels || []).includes(m.id));
-      if (favs.length) {
-        const optGroup = el("optgroup", { label: "Favorites" }, ...favs.map(m => el("option", { value: m.id }, m.id)));
-        modelSelect.appendChild(optGroup);
-      }
-    }
-    const otherGroup = el("optgroup", { label: "Models" }, ...models.map(m => el("option", { value: m.id || m }, m.id || m)));
-    modelSelect.appendChild(otherGroup);
-
-    // file tabs
-    renderFileTabs();
-    // apps list
-    rerenderAppsList();
-    // editor content
-    editorArea.value = state.editCode || (getSelectedApp() && getSelectedApp().code) || state.files.find(f=>f.name===state.activeFile)?.content || "";
-    renderEditorCharCount();
-    renderPreview();
-    renderAppDetails();
-    renderLog();
-
-    // show/hide Save & Deploy
-    const sel = getSelectedApp();
-    qs("#saveDeployBtn").style.display = (sel && editorArea.value) ? "inline-block" : "none";
-  }
-
-  // ---------- CRUD helpers ----------
-  function getSelectedApp() {
-    return state.apps.find(a => a._id === state.selectedAppId) || null;
-  }
-
-  function selectApp(appId) {
-    state.selectedAppId = appId;
-    const app = getSelectedApp();
-    if (app) {
-      state.editCode = "";
-      // set files to single index.html containing app.code
-      state.files = [{ name: "index.html", content: app.code || "" }];
-      state.activeFile = "index.html";
-      editorArea.value = app.code || "";
-      addLog(`Selected ${app.appTitle || app.appName}`);
-    }
-    updateUI();
-  }
-
-  function deleteAppHandler(appId) {
-    const app = state.apps.find(a => a._id === appId);
-    if (!app) return;
-    delApp(appId);
-    state.apps = getApps();
-    if (state.selectedAppId === appId) {
-      state.selectedAppId = null;
-      state.editCode = "";
-    }
-    addLog("✅ Deleted");
-    updateUI();
-  }
-
-  function toggleFavoriteApp(appId) {
-    const apps = getApps();
-    const idx = apps.findIndex(a => a._id === appId);
-    if (idx >= 0) {
-      apps[idx].favorite = !apps[idx].favorite;
-      saveJSON(DB_APPS, apps);
-      state.apps = apps;
-      updateUI();
-    }
-  }
-
-  function launchApp(appId) {
-    const app = state.apps.find(a => a._id === appId);
-    if (!app) return;
-    // increment views
-    app.views = (app.views || 0) + 1;
-    putApp(app);
-    state.apps = getApps();
-    window.open(app.hostedUrl || app.previewBlobUrl || "about:blank", "_blank");
-    addLog(`Launched: ${app.appName || app.subdomain || app._id}`);
-    updateUI();
-  }
-
-  // ---------- Files / Editor ----------
-  function openNewFileModal() {
-    const modal = el("div", { class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4", onclick: closeModal },
-      el("div", { class: "neu-box rounded-[24px] p-6 max-w-sm w-full bg-[var(--bg-secondary)]", onclick: (e) => e.stopPropagation() },
-        el("h3", { class: "font-black text-lg mb-4" }, "Create New File"),
-        el("div", { class: "space-y-4" },
-          el("label", { class: "text-xs font-bold text-[#666] block mb-2" }, "File Name"),
-          el("div", { class: "neu-inset rounded-xl p-1" },
-            el("input", { type: "text", id: "newFileNameInput", placeholder: "e.g., styles.css, script.js", class: "w-full p-2 bg-transparent" })
-          ),
-          el("div", { class: "flex gap-2" },
-            el("button", { class: "neu-btn flex-1", onclick: () => closeModal() }, "Cancel"),
-            el("button", {
-              class: "neu-btn-black flex-1",
-              onclick: () => {
-                const v = qs("#newFileNameInput").value.trim();
-                if (!v) return;
-                if (state.files.some(f => f.name.toLowerCase() === v.toLowerCase())) {
-                  addLog(`File "${v}" already exists`);
-                  return;
-                }
-                state.files.push({ name: v, content: "" });
-                state.activeFile = v;
-                updateUI();
-                closeModal();
-                addLog(`Created new file: ${v}`);
-              }
-            }, "Create")
-          )
-        )
-      )
-    );
-    showModal(modal);
-    setTimeout(()=>qs("#newFileNameInput").focus(), 10);
-  }
-
-  function deleteFile(name) {
-    if (state.files.length <= 1) return;
-    state.files = state.files.filter(f => f.name !== name);
-    if (state.activeFile === name) {
-      state.activeFile = state.files[0].name;
-    }
-    updateUI();
-  }
-
-  editorArea.addEventListener("input", (e) => {
-    const val = e.target.value;
-    state.editCode = val;
-    // update active file content
-    state.files = state.files.map(f => f.name === state.activeFile ? { ...f, content: val } : f);
-    renderEditorCharCount();
-    renderPreview();
-    renderAppDetails();
-  });
-
-  // ---------- Panel collapse / resize ----------
-  function toggleLeftCollapse() {
-    state.ui.leftCollapsed = !state.ui.leftCollapsed;
-    updateUI();
-  }
-  function toggleCodeCollapse() {
-    state.ui.codeCollapsed = !state.ui.codeCollapsed;
-    updateUI();
-  }
-  function togglePreviewCollapse() {
-    state.ui.previewCollapsed = !state.ui.previewCollapsed;
-    updateUI();
-  }
-
-  // Resizing logic
-  let resizing = null;
-  function startResize(which, e) {
-    resizing = which;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    const overlay = document.createElement("div");
-    overlay.id = "resizing-overlay";
-    overlay.style.position = "fixed";
-    overlay.style.inset = "0";
-    overlay.style.zIndex = "9999";
-    overlay.style.cursor = "col-resize";
-    document.body.appendChild(overlay);
-  }
-  window.addEventListener("mousemove", (e) => {
-    if (!resizing) return;
-    const rect = main.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const pct = (mouseX / rect.width) * 100;
-    if (resizing === "left") {
-      state.ui.leftPanelWidth = Math.max(10, Math.min(40, pct));
-      state.settings.leftPanelWidth = state.ui.leftPanelWidth;
-      saveSettings(state.settings);
-      updateUI();
-    } else if (resizing === "right") {
-      // code panel width from left edge
-      const left = state.ui.leftCollapsed ? 0 : state.ui.leftPanelWidth;
-      const newCode = Math.max(10, Math.min(80, pct - left));
-      state.ui.codePanelWidth = newCode;
-      state.settings.codePanelWidth = state.ui.codePanelWidth;
-      saveSettings(state.settings);
-      updateUI();
-    }
-  });
-  window.addEventListener("mouseup", () => {
-    if (!resizing) return;
-    resizing = null;
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-    const overlay = document.getElementById("resizing-overlay");
-    if (overlay) overlay.remove();
-  });
-  resizerLeft.addEventListener("mousedown", (e) => startResize("left", e));
-  resizerRight.addEventListener("mousedown", (e) => startResize("right", e));
-
-  // ---------- Export / Import ----------
-  const fileInput = el("input", { type: "file", accept: ".json", style: { display: "none" }, onchange: importApps });
-  document.body.appendChild(fileInput);
-
-  function openExportImport() {
-    const modal = el("div", { class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4", onclick: closeModal },
-      el("div", { class: "neu-box rounded-[24px] p-6 max-w-md w-full", onclick: (e) => e.stopPropagation() },
-        el("h3", { class: "font-black text-xl mb-4" }, "📦 Export / Import"),
-        el("div", { class: "space-y-3" },
-          el("button", { class: "neu-btn w-full rounded-xl py-3", onclick: exportApps }, "📤 Export All Apps (JSON)"),
-          el("button", { class: "neu-btn w-full rounded-xl py-3", onclick: () => fileInput.click() }, "📥 Import Apps (JSON)")
-        ),
-        el("button", { class: "neu-btn-black w-full rounded-xl py-3 mt-4", onclick: closeModal }, "Close")
-      )
-    );
-    showModal(modal);
-  }
-
-  function exportApps() {
-    const data = JSON.stringify(state.apps, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `jr-apps-export-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    addLog("✅ Exported apps");
-    closeModal();
-  }
-
-  function importApps(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    file.text().then(txt => {
+  // ---------- DB adapter ----------
+  const DB = (function () {
+    let useFireproof = false;
+    let db = null;
+    async function init() {
       try {
-        const imported = JSON.parse(txt);
-        const arr = Array.isArray(imported) ? imported : [imported];
-        for (const app of arr) {
-          delete app._id;
-          app._id = uid("app_");
-          app.createdAt = Date.now();
-          state.apps.unshift(app);
-          addVersion({ _id: uid("ver_"), type: "version", appId: app._id, code: app.code, version: app.version || 1, createdAt: Date.now(), note: "Imported" });
+        if (window.fireproof) { db = window.fireproof; useFireproof = true; return; }
+        // try dynamic import of fireproof (best-effort)
+        try {
+          const mod = await import('https://esm.sh/fireproof@0.18.9');
+          if (mod && mod.open) {
+            db = await mod.open('puter-apps-v6');
+            useFireproof = true;
+          }
+        } catch (e) {
+          useFireproof = false;
         }
-        saveJSON(DB_APPS, state.apps);
-        saveJSON(DB_VERSIONS, state.versions);
-        addLog(`✅ Imported ${arr.length} app(s)`);
-        updateUI();
-      } catch (err) {
-        addLog(`❌ Import failed: ${err.message}`);
-      } finally {
-        e.target.value = "";
-        closeModal();
+      } catch (e) {
+        useFireproof = false;
       }
-    });
-  }
+      if (!useFireproof) {
+        localStorage.setItem('va_apps', localStorage.getItem('va_apps') || '[]');
+        localStorage.setItem('va_versions', localStorage.getItem('va_versions') || '[]');
+      }
+    }
+    async function put(doc) {
+      if (useFireproof && db?.put) return db.put(doc);
+      const arr = JSON.parse(localStorage.getItem('va_apps') || '[]');
+      if (!doc._id) doc._id = `app_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+      const idx = arr.findIndex(a => a._id === doc._id);
+      if (idx >= 0) arr[idx] = doc; else arr.unshift(doc);
+      localStorage.setItem('va_apps', JSON.stringify(arr));
+      return doc;
+    }
+    async function get(id) {
+      if (useFireproof && db?.get) return db.get(id);
+      const arr = JSON.parse(localStorage.getItem('va_apps') || '[]');
+      return arr.find(a => a._id === id) || null;
+    }
+    async function del(id) {
+      if (useFireproof && db?.del) return db.del(id);
+      const arr = JSON.parse(localStorage.getItem('va_apps') || '[]');
+      const filtered = arr.filter(a => a._id !== id);
+      localStorage.setItem('va_apps', JSON.stringify(filtered));
+      return true;
+    }
+    async function allApps() {
+      if (useFireproof && db?.all) {
+        try { return await db.all(); } catch (e) {}
+      }
+      return JSON.parse(localStorage.getItem('va_apps') || '[]');
+    }
+    async function putVersion(v) {
+      if (useFireproof && db?.put) return db.put(v);
+      const arr = JSON.parse(localStorage.getItem('va_versions') || '[]');
+      if (!v._id) v._id = `ver_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+      arr.unshift(v);
+      // keep versions cap
+      while (arr.length > 200) arr.pop();
+      localStorage.setItem('va_versions', JSON.stringify(arr));
+      return v;
+    }
+    async function versionsForApp(appId) {
+      if (useFireproof && db?.all) {
+        try { const all = await db.all(); return (all || []).filter(x => x.type === 'version' && x.appId === appId).sort((a,b)=>b.version-a.version); } catch (e) {}
+      }
+      const arr = JSON.parse(localStorage.getItem('va_versions') || '[]');
+      return arr.filter(v => v.appId === appId).sort((a,b)=>b.version-a.version);
+    }
+    return { init, put, get, del, allApps, putVersion, versionsForApp, usingFireproof: () => useFireproof };
+  })();
 
-  // ---------- Share ----------
-  function openShare() {
-    const sel = getSelectedApp();
-    if (!sel) return;
-    const encoded = btoa(JSON.stringify({ prompt: sel.prompt, code: sel.code, title: sel.appTitle }));
-    const link = `${window.location.origin}${window.location.pathname}?share=${encoded}`;
-    const modal = el("div", { class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4", onclick: closeModal },
-      el("div", { class: "neu-box rounded-[24px] p-6 max-w-lg w-full", onclick: (e) => e.stopPropagation() },
-        el("h3", { class: "font-black text-xl mb-4" }, "🔗 Share App"),
-        el("div", { class: "neu-inset rounded-xl p-3 mb-4" }, el("input", { value: link, readonly: true, class: "w-full bg-transparent text-xs font-mono" })),
-        el("div", { class: "flex gap-3" },
-          el("button", { class: "neu-btn-red flex-1", onclick: () => { navigator.clipboard.writeText(link); addLog("✅ Link copied!"); } }, "📋 Copy Link"),
-          el("button", { class: "neu-btn-black flex-1", onclick: closeModal }, "Close")
-        )
-      )
-    );
-    showModal(modal);
-  }
+  await DB.init();
 
-  // ---------- Versions ----------
-  function openVersions() {
-    const sel = getSelectedApp();
-    if (!sel) return;
-    const appVersions = state.versions.filter(v => v.appId === sel._id).sort((a,b)=>b.version - a.version);
-    const list = appVersions.length ? appVersions.map(v => el("div", { class: "neu-inset rounded-xl p-3 flex justify-between items-center" },
-      el("div", {}, el("div", { class: "font-bold" }, `Version ${v.version}`), el("div", { class: "text-xs text-[#666]" }, new Date(v.createdAt).toLocaleString())),
-      el("button", { class: "neu-btn-black", onclick: () => { editorArea.value = v.code; state.editCode = v.code; closeModal(); addLog(`Restored v${v.version}`); updateUI(); } }, "Restore")
-    )) : [el("p", { class: "text-[#666] text-center py-4" }, "No versions saved yet")];
-
-    const modal = el("div", { class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4", onclick: closeModal },
-      el("div", { class: "neu-box rounded-[24px] p-6 max-w-md w-full max-h-[80vh] overflow-hidden", onclick: (e)=>e.stopPropagation() },
-        el("h3", { class: "font-black text-xl mb-4" }, "📚 Version History"),
-        el("div", { class: "space-y-2 max-h-[50vh] overflow-y-auto" }, ...list),
-        el("button", { class: "neu-btn-black w-full mt-4", onclick: closeModal }, "Close")
-      )
-    );
-    showModal(modal);
-  }
+  // ---------- DOM roots ----------
+  const leftRoot = document.getElementById(leftContentId);
+  const editorRoot = document.getElementById(editorAreaId);
+  const rightRoot = document.getElementById(rightContentId);
+  const newFileBtn = document.getElementById(newFileBtnId);
 
   // ---------- Templates ----------
-  function openTemplates() {
-    const modal = el("div", { class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4", onclick: closeModal },
-      el("div", { class: "neu-box rounded-[24px] p-6 max-w-2xl w-full max-h-[80vh] overflow-hidden", onclick: (e) => e.stopPropagation() },
-        el("div", { class: "flex justify-between items-center mb-6" }, el("h3", { class: "font-black text-xl" }, "🎨 App Templates"), el("button", { class: "neu-btn", onclick: closeModal }, "×")),
-        el("div", { class: "overflow-y-auto pr-2 custom-scrollbar" },
-          el("div", { class: "grid grid-cols-1 md:grid-cols-2 gap-4" }, ...state.templates.map(t => {
-            return el("button", { class: "p-4 rounded-2xl text-left transition-all flex flex-col gap-3 group bg-[var(--bg-secondary)]", onclick: () => { promptArea.value = t.prompt; inputAppTitle.value = t.name; closeModal(); } },
-              el("div", { class: "flex items-center justify-between" }, el("span", { class: "text-3xl" }, t.icon), el("div", { class: "text-[10px] font-black px-2 py-1 rounded-full bg-black/5" }, "Template")),
-              el("div", {}, el("div", { class: "font-bold text-sm mb-1" }, t.name), el("div", { class: "text-[var(--text-secondary)] text-xs" }, t.prompt))
-            );
-          }))
-        ),
-        el("button", { class: "neu-btn-black w-full mt-6", onclick: closeModal }, "Close")
-      )
-    );
-    showModal(modal);
+  function defaultTemplates() {
+    return [
+      { id: 'todo', name: 'Todo App', icon: '✅', prompt: 'A todo app with localStorage' },
+      { id: 'notes', name: 'Notes App', icon: '📝', prompt: 'Notes with markdown preview' },
+      { id: 'ai-chat', name: 'AI Chat', icon: '🤖', prompt: 'Simple chat UI' },
+    ];
+  }
+  State.set({ templates: defaultTemplates() });
+
+  // ---------- Logging ----------
+  function addLog(msg) { State.pushLog(msg); }
+
+  // ---------- Editor (CodeMirror 5) ----------
+  let editor = null;
+  let editorInitialized = false;
+  let autosaveTimer = null;
+  const AUTOSAVE_DELAY = 5000; // ms
+
+  function createEditor(initialValue = '') {
+    editorRoot.innerHTML = '';
+    const tabsWrap = el('div', { class: 'file-tabs-wrapper', style: 'padding:8px;border-bottom:1px solid var(--border-color)' });
+    editorRoot.appendChild(tabsWrap);
+    const textarea = el('textarea', { style: 'width:100%;height:100%' });
+    editorRoot.appendChild(textarea);
+    const cm = CodeMirror.fromTextArea(textarea, {
+      mode: 'htmlmixed',
+      lineNumbers: true,
+      lineWrapping: true,
+      tabSize: 2,
+      indentWithTabs: false,
+      viewportMargin: Infinity,
+      theme: document.body.className.includes('theme-dark') ? 'material' : 'default',
+    });
+    cm.setSize('100%', '520px');
+    return { cm, tabsWrap };
   }
 
-  // ---------- Settings ----------
-  function openSettings() {
-    const themes = ["light", "dark", "grey", "multicoloured"];
-    const providersList = ["Puter", "Pollinations", "Google", "Github", "OpenRouter", "Custom"];
-    let tempTheme = state.settings.appTheme || "light";
-    const modal = el("div", { class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4", onclick: closeModal },
-      el("div", { class: "neu-box rounded-[24px] p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto", onclick: (e) => e.stopPropagation() },
-        el("div", { class: "flex justify-between items-center mb-6" }, el("h3", { class: "font-black text-xl" }, "⚙️ Settings"), el("div", {},
-          el("button", { class: "neu-btn", onclick: () => switchSettingsTab("AI") }, "AI"),
-          el("button", { class: "neu-btn", onclick: () => switchSettingsTab("UI") }, "UI")
-        )),
-        // content
-        el("div", { id: "settingsContent" },
-          // default AI tab
-          el("div", { id: "settingsAI" },
-            el("div", {},
-              el("label", { class: "text-sm font-bold text-[#666]" }, "Provider"),
-              el("select", {
-                class: "neu-inset w-full rounded-xl p-3",
-                onchange: (e) => {
-                  state.settings.activeProvider = e.target.value;
-                },
-                value: state.settings.activeProvider
-              }, ...providersList.map(p => el("option", { value: p }, p)))
-            ),
-            el("div", { class: "space-y-3 mt-4" },
-              el("label", { class: "text-xs font-bold" }, "Pollinations API Key"),
-              el("div", { class: "flex gap-2" },
-                el("input", { type: "password", class: "neu-inset flex-1 p-3", value: state.settings.apiKeys?.Pollinations || "", onchange: (e) => { state.settings.apiKeys = state.settings.apiKeys || {}; state.settings.apiKeys.Pollinations = e.target.value; } }),
-                el("button", { class: "neu-btn", onclick: async () => { await handleSaveKey("Pollinations", state.settings.apiKeys?.Pollinations || ""); } }, "Save Key"),
-                el("button", { class: "neu-btn", onclick: async () => { await testApiKey(); } }, "Test Key")
-              ),
-              el("div", { id: "settingsTestStatus", class: "text-[10px] font-bold" })
-            )
-          ),
-          // UI tab hidden initially
-          el("div", { id: "settingsUI", style: { display: "none" } },
-            el("div", { class: "space-y-2" },
-              el("label", { class: "text-sm font-bold" }, "Theme"),
-              el("div", { class: "grid grid-cols-4 gap-2" }, ...themes.map(t => {
-                return el("button", { class: `p-3 rounded-xl text-xs font-bold ${tempTheme === t ? "neu-inset" : "neu-btn"}`, onclick: () => { tempTheme = t; document.body.className = `theme-${t}`; } }, t);
-              }))
-            ),
-            el("div", { class: "space-y-2 mt-4" },
-              el("label", { class: "text-sm font-bold" }, "App Layout"),
-              el("div", { class: "grid grid-cols-3 gap-3" },
-                el("button", { class: `neu-btn p-4`, onclick: () => { state.settings.appLayout = "side-by-side"; } }, "Side by Side"),
-                el("button", { class: `neu-btn p-4`, onclick: () => { state.settings.appLayout = "stacked"; } }, "Stacked"),
-                el("button", { class: `neu-btn p-4`, onclick: () => { state.settings.appLayout = "custom"; } }, "Custom")
-              )
-            )
-          )
-        ),
-        el("div", { class: "flex gap-4 mt-8" },
-          el("button", { class: "neu-btn-black flex-1", onclick: () => { state.settings.appTheme = tempTheme; saveSettings(state.settings); closeModal(); updateUI(); } }, "Save"),
-          el("button", { class: "neu-btn flex-1", onclick: () => { document.body.className = `theme-${state.settings.appTheme}`; closeModal(); } }, "Cancel")
-        )
-      )
-    );
+  function initEditor() {
+    const st = State.get();
+    const file = st.files.find(f => f.name === st.activeFile) || st.files[0];
+    const { cm } = createEditor(file?.content || '');
+    editor = cm;
+    editorInitialized = true;
 
-    function switchSettingsTab(tab) {
-      qs("#settingsAI").style.display = tab === "AI" ? "" : "none";
-      qs("#settingsUI").style.display = tab === "UI" ? "" : "none";
-    }
-    showModal(modal);
+    editor.on('change', debounce(() => {
+      const content = editor.getValue();
+      const files = State.get().files.map(f => f.name === State.get().activeFile ? ({ ...f, content }) : f);
+      State.updateFiles(files);
+      scheduleAutosave();
+    }, 120));
+    renderFileTabs();
   }
 
-  async function handleSaveKey(provider, key) {
-    state.settings.apiKeys = state.settings.apiKeys || {};
-    state.settings.apiKeys[provider] = key;
-    saveSettings(state.settings);
-    addLog("Key saved!");
-    if (provider === "Pollinations" && key) {
-      // attempt to fetch list of models
-      try {
-        const res = await fetch("https://gen.pollinations.ai/text/models");
-        const data = await res.json();
-        state.pollinationsModels = (data || []).map(m => ({ id: m.name, name: m.name, provider: "Pollinations", description: m.description || "" }));
-        addLog(`Key saved! Found ${state.pollinationsModels.length} models.`);
-        updateUI();
-      } catch (err) {
-        addLog("Key saved but failed to fetch models.");
+  // ---------- File Tabs ----------
+  function renderFileTabs() {
+    if (!editorInitialized) return;
+    const tabsWrap = editorRoot.querySelector('.file-tabs-wrapper');
+    if (!tabsWrap) return;
+    tabsWrap.innerHTML = '';
+    const st = State.get();
+    const files = st.files || [];
+    const row = el('div', { style: 'display:flex;gap:6px;align-items:center;overflow:auto' });
+    files.forEach(f => {
+      const btn = el('button', { class: 'neu-btn', style: `white-space:nowrap;${st.activeFile===f.name?'font-weight:800':''}` }, [f.name]);
+      btn.addEventListener('click', () => {
+        State.setActiveFile(f.name);
+        const file = State.get().files.find(ff => ff.name === f.name);
+        if (editor && file && editor.getValue() !== file.content) editor.setValue(file.content || '');
+        renderFileTabs();
+      });
+      if (files.length > 1) {
+        const del = el('span', { style: 'margin-left:6px;cursor:pointer' }, ['×']);
+        del.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (!confirm(`Delete file ${f.name}?`)) return;
+          const newFiles = State.get().files.filter(ff => ff.name !== f.name);
+          State.updateFiles(newFiles);
+          if (State.get().activeFile === f.name && newFiles.length) {
+            State.setActiveFile(newFiles[0].name);
+            if (editor) editor.setValue(newFiles[0].content || '');
+          }
+          renderFileTabs();
+        });
+        btn.appendChild(del);
       }
-    }
+      row.appendChild(btn);
+    });
+    const addBtn = el('button', { class: 'neu-btn', title: 'Add file' }, ['＋']);
+    addBtn.addEventListener('click', () => {
+      const name = prompt('New file name (example: index.html)');
+      if (!name) return;
+      if (State.get().files.some(f => f.name.toLowerCase() === name.toLowerCase())) { addLog(`File "${name}" already exists`); return; }
+      State.addFile({ name, content: '' });
+      if (editor) editor.setValue('');
+      renderFileTabs();
+    });
+    row.appendChild(addBtn);
+    tabsWrap.appendChild(row);
+
+    // add format button and copy/format/save controls
+    const utilRow = el('div', { style: 'display:flex;gap:6px;align-items:center;margin-left:12px' });
+    const copyBtn = el('button', { class: 'neu-btn', title: 'Copy code' }, ['📋 Copy']);
+    copyBtn.addEventListener('click', () => { navigator.clipboard.writeText(editor.getValue()); addLog('Code copied'); });
+    const formatBtn = el('button', { class: 'neu-btn', title: 'Format code' }, ['✨ Format']);
+    formatBtn.addEventListener('click', () => {
+      const v = editor.getValue();
+      const formatted = formatCodeByType(v, State.get().activeFile);
+      editor.setValue(formatted);
+      addLog('Formatted code');
+    });
+    const saveBtn = el('button', { class: 'neu-btn', title: 'Save as app (Ctrl+S)' }, ['💾 Save']);
+    saveBtn.addEventListener('click', () => saveActiveFileAsApp());
+    utilRow.appendChild(copyBtn); utilRow.appendChild(formatBtn); utilRow.appendChild(saveBtn);
+    tabsWrap.appendChild(utilRow);
   }
 
-  async function testApiKey() {
-    const status = qs("#settingsTestStatus");
-    status.textContent = "Testing...";
+  // ---------- Formatting (basic) ----------
+  // Attempt a simple HTML pretty printer using DOMParser -> serialized with indentation.
+  function formatHtml(html) {
     try {
-      const res = await fetch("https://gen.pollinations.ai/text/models");
-      if (res.ok) {
-        const data = await res.json();
-        state.pollinationsModels = (data || []).map(m => ({ id: m.name, name: m.name }));
-        status.textContent = `Valid key! Found ${state.pollinationsModels.length} models.`;
-        addLog(status.textContent);
-        updateUI();
-      } else {
-        status.textContent = "Invalid key or API error.";
-        addLog(status.textContent);
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      function pprint(node, indent = 0) {
+        const pad = '  '.repeat(indent);
+        if (node.nodeType === Node.TEXT_NODE) {
+          const t = node.textContent.trim();
+          if (!t) return '';
+          return pad + t + '\n';
+        }
+        if (node.nodeType === Node.COMMENT_NODE) return pad + '<!--' + node.nodeValue + '-->\n';
+        let out = '';
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          out += pad + `<${node.tagName.toLowerCase()}`;
+          for (const attr of node.attributes) out += ` ${attr.name}="${attr.value}"`;
+          out += '>\n';
+          for (const child of node.childNodes) out += pprint(child, indent + 1);
+          out += pad + `</${node.tagName.toLowerCase()}>\n`;
+        }
+        return out;
       }
-    } catch (err) {
-      status.textContent = "Connection error. Check your key.";
-      addLog(status.textContent);
+      let body = '';
+      // include doctype if present
+      const doctype = Array.from(doc.childNodes).find(n => n.nodeType === Node.DOCUMENT_TYPE_NODE);
+      if (doctype) body += '<!doctype html>\n';
+      for (const child of doc.documentElement.childNodes) { /* ignore html wrapper here */ }
+      // produce html structure manually
+      body += '<html>\n';
+      body += pprint(doc.head, 1);
+      body += pprint(doc.body, 1);
+      body += '</html>\n';
+      return body;
+    } catch (e) {
+      // fallback: simple indent around tags
+      return html.replace(/>\s*</g, '>\n<').split('\n').map(line => line.trim() ? line : '').join('\n');
     }
   }
 
-  // ---------- Build & Deploy / Update ----------
-  async function buildAndDeploy(customPrompt) {
-    const finalPrompt = customPrompt || promptArea.value || "";
-    if (!finalPrompt.trim()) {
-      addLog("Please enter a prompt");
+  function formatJs(js) {
+    // very naive: just semicolon/brace formatting (not a replacement for prettier)
+    try {
+      return js.replace(/\s+/g, ' ').replace(/;\s*/g, ';\n').replace(/\{\s*/g, '{\n').replace(/\}\s*/g, '\n}\n');
+    } catch {
+      return js;
+    }
+  }
+
+  function formatCss(css) {
+    try {
+      return css.replace(/\s+/g, ' ').replace(/\{\s*/g, ' {\n').replace(/\}\s*/g, '\n}\n').replace(/;\s*/g, ';\n');
+    } catch {
+      return css;
+    }
+  }
+
+  function formatCodeByType(code, filename = '') {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    if (ext === 'html' || code.includes('<!doctype') || code.includes('<html')) return formatHtml(code);
+    if (ext === 'js') return formatJs(code);
+    if (ext === 'css') return formatCss(code);
+    // fallback: try html formatting
+    return formatHtml(code);
+  }
+
+  // ---------- Autosave & Versions ----------
+  // Autosave current file content into a local versions stack and optionally to DB as versions
+  function scheduleAutosave() {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(async () => {
+      const file = State.get().files.find(f => f.name === State.get().activeFile);
+      if (!file) return;
+      // store autosave snapshot in localStorage map
+      const key = 'va_autosave_versions';
+      const map = JSON.parse(localStorage.getItem(key) || '{}');
+      map[file.name] = map[file.name] || [];
+      map[file.name].unshift({ createdAt: Date.now(), content: file.content });
+      // cap snapshots
+      if (map[file.name].length > 30) map[file.name].pop();
+      localStorage.setItem(key, JSON.stringify(map));
+      addLog(`Autosaved ${file.name}`);
+      // if app exists in DB, also create a version record
+      // find app by name
+      const apps = await DB.allApps();
+      const app = apps.find(a => a.appName === file.name.replace(/\.[^.]+$/, ''));
+      if (app) {
+        const newVersion = (app.version || 0) + 1;
+        await DB.putVersion({ type: 'version', appId: app._id, code: file.content, version: newVersion, createdAt: Date.now(), note: 'Autosave' });
+        // update app version
+        app.version = newVersion;
+        await DB.put(app);
+        addLog(`Saved version ${newVersion} for ${app.appName}`);
+      }
+    }, AUTOSAVE_DELAY);
+  }
+
+  // Manual save active file as app
+  async function saveActiveFileAsApp() {
+    const file = State.get().files.find(f => f.name === State.get().activeFile);
+    if (!file) return;
+    // ask for app name / title
+    const title = prompt('App title (optional)', file.name) || file.name;
+    const doc = {
+      type: 'app',
+      appName: file.name.replace(/\.[^.]+$/, ''),
+      appTitle: title,
+      prompt: 'Saved from editor',
+      code: file.content,
+      createdAt: Date.now(),
+      version: 1,
+      views: 0,
+      favorite: false,
+    };
+    const saved = await DB.put(doc);
+    await DB.putVersion({ type: 'version', appId: saved._id, code: file.content, version: 1, createdAt: Date.now(), note: 'Saved from editor' });
+    const apps = await DB.allApps();
+    State.set({ apps });
+    addLog(`Saved ${file.name} as app ${saved.appName}`);
+  }
+
+  // ---------- Export / Import UI ----------
+  async function openExportImportModal() {
+    const container = el('div', { role: 'dialog', aria: { label: 'Export Import' } });
+    container.appendChild(el('h3', {}, ['📦 Export / Import Apps']));
+    const exportBtn = el('button', { class: 'neu-btn', style: 'margin-top:8px' }, ['Export All (JSON)']);
+    exportBtn.addEventListener('click', async () => {
+      const apps = await DB.allApps();
+      const blob = new Blob([JSON.stringify(apps, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = el('a', { href: url, download: `aijr-apps-export-${Date.now()}.json` });
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      addLog('Exported apps');
+    });
+    container.appendChild(exportBtn);
+
+    container.appendChild(el('div', { style: 'margin-top:12px' }, ['Import JSON (merge or replace)']));
+    const fileInput = el('input', { type: 'file', accept: '.json', style: 'margin-top:8px' });
+    container.appendChild(fileInput);
+
+    const mergeReplaceRow = el('div', { style: 'display:flex;gap:8px;margin-top:8px' });
+    const mergeBtn = el('button', { class: 'neu-btn' }, ['Merge']);
+    const replaceBtn = el('button', { class: 'neu-btn' }, ['Replace']);
+    mergeReplaceRow.appendChild(mergeBtn); mergeReplaceRow.appendChild(replaceBtn);
+    container.appendChild(mergeReplaceRow);
+
+    let parsedJSON = null;
+    fileInput.addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = (ev) => {
+        try {
+          parsedJSON = JSON.parse(ev.target.result);
+          container.appendChild(el('pre', { style: 'max-height:200px;overflow:auto;margin-top:8px;background:var(--bg-secondary);padding:8px;border-radius:8px' }, [JSON.stringify(parsedJSON, null, 2)]));
+        } catch (err) {
+          addLog('Invalid JSON file');
+        }
+      };
+      r.readAsText(f);
+    });
+
+    mergeBtn.addEventListener('click', async () => {
+      if (!parsedJSON) return addLog('No file parsed');
+      const arr = Array.isArray(parsedJSON) ? parsedJSON : [parsedJSON];
+      const existing = await DB.allApps();
+      // merge by appName uniqueness (avoid duplicates)
+      for (const a of arr) {
+        const exists = existing.find(e => e.appName === a.appName);
+        if (exists) {
+          // create new app with suffix
+          a.appName = `${a.appName}_import_${Math.random().toString(36).slice(2,5)}`;
+        }
+        delete a._id;
+        a._id = `app_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+        await DB.put(a);
+      }
+      const apps = await DB.allApps();
+      State.set({ apps });
+      addLog(`Imported (merged) ${arr.length} app(s)`);
+      modal.close();
+    });
+
+    replaceBtn.addEventListener('click', async () => {
+      if (!parsedJSON) return addLog('No file parsed');
+      const arr = Array.isArray(parsedJSON) ? parsedJSON : [parsedJSON];
+      // replace storage
+      localStorage.setItem('va_apps', JSON.stringify(arr));
+      State.set({ apps: arr });
+      addLog(`Imported (replaced) ${arr.length} app(s)`);
+      modal.close();
+    });
+
+    const modal = openModal(container);
+    // Accessibility: focus modal
+    modal.modalBox.setAttribute('role', 'dialog');
+    modal.modalBox.setAttribute('aria-modal', 'true');
+    modal.modalBox.focus && modal.modalBox.focus();
+  }
+
+  // ---------- Settings modal with preview & model lists ----------
+  function openSettingsModal() {
+    const st = State.get();
+    const container = el('div', { role: 'dialog' });
+    container.appendChild(el('h3', {}, ['⚙️ Settings']));
+    // Theme preview: apply temp theme on hover/click
+    container.appendChild(el('div', { style: 'margin-top:8px;font-weight:700' }, ['Theme']));
+    const themesRow = el('div', { style: 'display:flex;gap:8px;margin-top:6px' });
+    ['light', 'dark', 'grey', 'multicoloured'].forEach(t => {
+      const b = el('button', { class: 'neu-btn' }, [t]);
+      b.addEventListener('mouseenter', () => document.body.className = `theme-${t}`);
+      b.addEventListener('mouseleave', () => document.body.className = `theme-${State.get().theme}`);
+      b.addEventListener('click', () => { State.set({ theme: t }); addLog(`Theme saved: ${t}`); });
+      themesRow.appendChild(b);
+    });
+    container.appendChild(themesRow);
+
+    // Layout preview
+    container.appendChild(el('div', { style: 'margin-top:12px;font-weight:700' }, ['Layout']));
+    const layouts = ['side-by-side', 'stacked', 'custom'];
+    const layoutRow = el('div', { style: 'display:flex;gap:8px;margin-top:6px' });
+    layouts.forEach(l => {
+      const b = el('button', { class: 'neu-btn' }, [l]);
+      b.addEventListener('click', () => { State.set({ layout: l }); addLog(`Layout set: ${l}`); });
+      layoutRow.appendChild(b);
+    });
+    container.appendChild(layoutRow);
+
+    // Provider models listing for Pollinations & favorites
+    container.appendChild(el('div', { style: 'margin-top:12px;font-weight:700' }, ['Provider Models']));
+    const modelsWrap = el('div', { style: 'max-height:160px;overflow:auto;margin-top:8px' });
+    const pollModels = State.get().pollinationsModels || [];
+    if (pollModels.length === 0) modelsWrap.appendChild(el('div', { style: 'color:var(--text-secondary)' }, ['No Pollinations models loaded']));
+    else {
+      pollModels.slice(0, 50).forEach(m => {
+        const row = el('div', { style: 'display:flex;align-items:center;justify-content:space-between;padding:6px;border-bottom:1px solid var(--border-color)' }, [
+          el('div', { style: 'font-family:monospace;font-size:12px' }, [m.id || m.name]),
+          el('div', {}, [ el('button', { class: 'neu-btn' }, [ State.get().favoriteModels.has(m.id) ? '★' : '☆' ]) ])
+        ]);
+        row.querySelector('button').addEventListener('click', () => {
+          State.toggleFavoriteModel ? State.toggleFavoriteModel(m.id) : null;
+          addLog(`Toggled favorite model ${m.id}`);
+          // re-render models list
+          openSettingsModal(); // quick re-open to refresh (simple approach)
+        });
+        modelsWrap.appendChild(row);
+      });
+    }
+    container.appendChild(modelsWrap);
+
+    openModal(container);
+  }
+
+  // ---------- Accessibility: modal helper with focus trap basics ----------
+  function openModal(innerEl) {
+    const overlay = el('div', { class: 'va-modal-overlay', tabindex: '-1', onClick: () => overlay.remove() });
+    const modalBox = el('div', { class: 'va-modal neu-box', tabindex: '0', onClick: (e) => e.stopPropagation() });
+    modalBox.appendChild(innerEl);
+    overlay.appendChild(modalBox);
+    document.body.appendChild(overlay);
+    // Basic focus management: focus first focusable or modalBox
+    setTimeout(() => {
+      const focusable = modalBox.querySelector('button, input, textarea, select, [tabindex]');
+      (focusable || modalBox).focus();
+    }, 10);
+    // close on ESC
+    const escHandler = (e) => { if (e.key === 'Escape') overlay.remove(); };
+    window.addEventListener('keydown', escHandler);
+    return {
+      overlay,
+      modalBox,
+      close: () => { overlay.remove(); window.removeEventListener('keydown', escHandler); },
+    };
+  }
+
+  // ---------- Export single / share / versions / deploy (enhanced) ----------
+  async function exportSingleApp(app) {
+    const blob = new Blob([JSON.stringify(app, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = el('a', { href: url, download: `${app.appName || 'app'}-export.json` });
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    addLog('Exported app');
+  }
+
+  function openShareModal(app) {
+    const encoded = btoa(JSON.stringify({ prompt: app.prompt, code: app.code, title: app.appTitle }));
+    const link = `${window.location.origin}${window.location.pathname}?share=${encoded}`;
+    const container = el('div', {});
+    container.appendChild(el('h3', {}, ['🔗 Share']));
+    const input = el('input', { value: link, style: 'width:100%;padding:8px' });
+    container.appendChild(input);
+    const copy = el('button', { class: 'neu-btn', style: 'margin-top:8px' }, ['Copy']);
+    copy.addEventListener('click', () => { navigator.clipboard.writeText(link); addLog('Share link copied'); });
+    container.appendChild(copy);
+    openModal(container);
+  }
+
+  async function openVersionsModal(app) {
+    const versions = await DB.versionsForApp(app._id);
+    const container = el('div', {});
+    container.appendChild(el('h3', {}, ['📚 Versions']));
+    if (!versions || versions.length === 0) container.appendChild(el('div', {}, ['No versions']));
+    else {
+      const list = el('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' });
+      versions.forEach(v => {
+        const row = el('div', { class: 'neu-inset', style: 'padding:8px;display:flex;justify-content:space-between;align-items:center' }, [
+          el('div', {}, [el('div', { style: 'font-weight:700' }, [`v${v.version}`]), el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [new Date(v.createdAt).toLocaleString()])]),
+          el('div', {}, [ el('button', { class: 'neu-btn' }, ['Restore']) ])
+        ]);
+        row.querySelector('button').addEventListener('click', () => {
+          if (editor) editor.setValue(v.code || '');
+          addLog(`Restored v${v.version}`);
+          modal.close();
+        });
+        list.appendChild(row);
+      });
+      container.appendChild(list);
+    }
+    const modal = openModal(container);
+  }
+
+  // ---------- Launch / update / delete ----------
+  async function launchApp(app) {
+    addLog(`Launching ${app.appName || app._id}`);
+    if (app.appName && window.puter?.apps?.launch) {
+      try { await window.puter.apps.launch(app.appName); addLog('Launched via Puter SDK'); return; } catch (e) { /* fallback */ }
+    }
+    if (app.hostedUrl) window.open(app.hostedUrl, '_blank');
+    else {
+      const blob = new Blob([app.code || ''], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+  }
+
+  async function updateAndRedeploy(appDoc, newCode) {
+    if (!appDoc) return;
+    addLog('Updating app...');
+    const overlay = el('div', { class: 'code-loading-overlay' }, [ el('div', { class: 'code-spinner' }), el('div', { style: 'margin-top:12px' }, ['Updating...']) ]);
+    editorRoot.appendChild(overlay);
+    try {
+      const newVersion = (appDoc.version || 1) + 1;
+      const updated = { ...appDoc, code: newCode, updatedAt: Date.now(), version: newVersion };
+      await DB.put(updated);
+      await DB.putVersion({ type: 'version', appId: updated._id, code: newCode, version: newVersion, createdAt: Date.now(), note: `v${newVersion}` });
+      addLog(`Updated ${updated.appName} to v${newVersion}`);
+      const apps = await DB.allApps(); State.set({ apps });
+    } catch (e) { addLog('Update failed: ' + (e.message || e)); }
+    overlay.remove();
+  }
+
+  async function deleteApp(app) {
+    if (!confirm(`Delete ${app.appTitle || app.appName || app._id}?`)) return;
+    try {
+      if (app.appName && window.puter?.apps?.delete) { try { await window.puter.apps.delete(app.appName); } catch (e) {} }
+      if (app.subdomain && window.puter?.hosting?.delete) { try { await window.puter.hosting.delete(app.subdomain); } catch (e) {} }
+      await DB.del(app._id);
+      addLog('Deleted app');
+      const apps = await DB.allApps(); State.set({ apps });
+    } catch (e) { addLog('Delete failed'); }
+  }
+
+  // ---------- Usage refresh ----------
+  async function refreshUsage() {
+    addLog('Refreshing usage...');
+    if (window.puter?.auth?.getMonthlyUsage) {
+      try {
+        const u = await window.puter.auth.getMonthlyUsage();
+        State.set({ usage: u });
+        addLog('Usage updated');
+        const fill = document.getElementById('usage-fill');
+        if (fill && u?.allowanceInfo) {
+          const { monthUsageAllowance, remaining } = u.allowanceInfo;
+          const used = monthUsageAllowance - remaining;
+          const pct = Math.min(100, Math.round((used / monthUsageAllowance) * 100));
+          fill.style.width = pct + '%';
+          fill.classList.add('usage-bar-pulse');
+          setTimeout(() => fill.classList.remove('usage-bar-pulse'), 1200);
+        }
+      } catch (e) { addLog('Usage fetch failed'); }
+    } else {
+      const fill = document.getElementById('usage-fill');
+      if (fill) { fill.style.width = `${Math.floor(Math.random()*60)+10}%`; fill.classList.add('usage-bar-pulse'); setTimeout(()=>fill.classList.remove('usage-bar-pulse'),1200); }
+    }
+  }
+
+  // ---------- UI renderers ----------
+  function renderLeft() {
+    leftRoot.innerHTML = '';
+    const header = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px' }, [
+      el('div', {}, [el('strong', {}, ['Create / Apps'])]),
+      el('div', {}, [
+        el('button', { class: 'collapse-btn', onClick: () => openTemplatesModal() }, ['🎨']),
+        el('button', { class: 'collapse-btn', onClick: () => openSettingsModal() }, ['⚙️']),
+      ]),
+    ]);
+    leftRoot.appendChild(header);
+
+    const buildBtn = el('button', { class: 'neu-btn', style: 'width:100%;margin-bottom:8px' }, ['🚀 Create & Deploy']);
+    buildBtn.addEventListener('click', () => openBuildModal());
+    leftRoot.appendChild(buildBtn);
+
+    // search & filters
+    const search = el('input', { placeholder: 'Search apps...', style: 'width:100%;padding:8px;margin-bottom:8px' });
+    search.addEventListener('input', debounce((e) => { ui.searchQuery = e.target.value; renderAppsMini(); }, 200));
+    leftRoot.appendChild(search);
+    const filtersRow = el('div', { style: 'display:flex;gap:8px;margin-bottom:8px' });
+    const favBtn = el('button', { class: 'neu-btn' }, ['⭐ Favorites']);
+    favBtn.addEventListener('click', () => { ui.filterFavorites = !ui.filterFavorites; renderAppsMini(); });
+    const bulkBtn = el('button', { class: 'neu-btn' }, ['☑️ Select']);
+    bulkBtn.addEventListener('click', () => { ui.bulkMode = !ui.bulkMode; ui.selectedApps = new Set(); renderAppsMini(); });
+    filtersRow.appendChild(favBtn); filtersRow.appendChild(bulkBtn);
+    leftRoot.appendChild(filtersRow);
+
+    const appsContainer = el('div', { class: 'apps-mini', style: 'max-height:320px;overflow:auto' });
+    leftRoot.appendChild(appsContainer);
+
+    // attach export/import quick link
+    const exportImport = el('div', { style: 'margin-top:8px;display:flex;gap:8px' }, [
+      el('button', { class: 'neu-btn' }, ['📦 Export/Import']),
+    ]);
+    exportImport.querySelector('button').addEventListener('click', openExportImportModal);
+    leftRoot.appendChild(exportImport);
+
+    async function renderAppsMini() {
+      appsContainer.innerHTML = '';
+      let apps = State.get().apps || [];
+      if (ui.filterFavorites) apps = apps.filter(a => a.favorite);
+      if (ui.searchQuery) {
+        const q = ui.searchQuery.toLowerCase();
+        apps = apps.filter(a => (a.appName||'').toLowerCase().includes(q) || (a.appTitle||'').toLowerCase().includes(q) || (a.prompt||'').toLowerCase().includes(q));
+      }
+      if (ui.sortBy === 'date') apps = apps.sort((a,b)=> (b.createdAt||0) - (a.createdAt||0));
+      else if (ui.sortBy === 'views') apps = apps.sort((a,b)=> (b.views||0) - (a.views||0));
+      else if (ui.sortBy === 'name') apps = apps.sort((a,b)=> (a.appTitle||a.appName||'').localeCompare(b.appTitle||b.appName||''));
+      if (!apps || apps.length === 0) appsContainer.appendChild(el('div', { style: 'color:var(--text-secondary)' }, ['No apps']));
+      else {
+        apps.forEach(app => {
+          const row = el('div', { class: 'neu-inset', style: 'padding:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center' });
+          const left = el('div', {}, [el('div', { style: 'font-weight:700' }, [app.appTitle || app.appName]), el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [app.prompt?.slice(0,80)||''])]);
+          row.appendChild(left);
+          const actions = el('div', { style: 'display:flex;gap:6px;align-items:center' });
+          if (ui.bulkMode) {
+            const chk = el('input', { type: 'checkbox' });
+            chk.checked = ui.selectedApps.has(app._id);
+            chk.addEventListener('change', (e) => { if (e.target.checked) ui.selectedApps.add(app._id); else ui.selectedApps.delete(app._id); });
+            actions.appendChild(chk);
+          } else {
+            const fav = el('button', { class: 'neu-btn' }, [app.favorite ? '⭐' : '☆']);
+            fav.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              app.favorite = !app.favorite;
+              await DB.put(app);
+              const all = await DB.allApps();
+              State.set({ apps: all });
+              addLog(`${app.appTitle || app.appName} favorite: ${app.favorite}`);
+              renderAppsMini();
+            });
+            actions.appendChild(fav);
+
+            const openBtn = el('button', { class: 'neu-btn' }, ['Open']);
+            openBtn.addEventListener('click', () => { State.addFile({ name: `${app.appName || app._id}.html`, content: app.code || '' }); if (editor) editor.setValue(app.code || ''); addLog(`Opened ${app.appTitle || app.appName}`); renderFileTabs(); });
+            actions.appendChild(openBtn);
+
+            const launch = el('button', { class: 'neu-btn' }, ['▶']);
+            launch.addEventListener('click', async () => { await incrementViews(app); if (app.hostedUrl) window.open(app.hostedUrl, '_blank'); else { const blob = new Blob([app.code||''],{type:'text/html'}); const url = URL.createObjectURL(blob); window.open(url,'_blank'); setTimeout(()=>URL.revokeObjectURL(url),5000); } });
+            actions.appendChild(launch);
+
+            const versionsBtn = el('button', { class: 'neu-btn' }, ['📚']);
+            versionsBtn.addEventListener('click', () => openVersionsModal(app));
+            actions.appendChild(versionsBtn);
+
+            const shareBtn = el('button', { class: 'neu-btn' }, ['🔗']);
+            shareBtn.addEventListener('click', () => openShareModal(app));
+            actions.appendChild(shareBtn);
+
+            const exportBtn = el('button', { class: 'neu-btn' }, ['📤']);
+            exportBtn.addEventListener('click', async (e) => { e.stopPropagation(); await exportSingleApp(app); });
+            actions.appendChild(exportBtn);
+
+            const del = el('button', { class: 'neu-btn' }, ['🗑️']);
+            del.addEventListener('click', async (e) => { e.stopPropagation(); await deleteApp(app); renderAppsMini(); });
+            actions.appendChild(del);
+          }
+          row.appendChild(actions);
+          appsContainer.appendChild(row);
+        });
+
+        if (ui.bulkMode && ui.selectedApps.size > 0) {
+          const footer = el('div', { style: 'margin-top:8px;display:flex;gap:8px' });
+          const delSel = el('button', { class: 'neu-btn' }, [`Delete ${ui.selectedApps.size} Selected`]);
+          delSel.addEventListener('click', async () => {
+            if (!confirm(`Delete ${ui.selectedApps.size} apps?`)) return;
+            for (const id of ui.selectedApps) { const a = (State.get().apps || []).find(x => x._id === id); if (a) await deleteApp(a); }
+            ui.selectedApps = new Set(); ui.bulkMode = false;
+            const apps = await DB.allApps(); State.set({ apps }); renderAppsMini();
+          });
+          footer.appendChild(delSel);
+          appsContainer.appendChild(footer);
+        }
+      }
+    }
+  }
+
+  function renderRight() {
+    rightRoot.innerHTML = '';
+    const header = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;padding:8px' }, [
+      el('div', { style: 'font-weight:700' }, ['Preview']),
+      el('div', {}, [
+        el('button', { class: 'neu-btn', onClick: () => {
+          const code = State.get().files.find(f => f.name === State.get().activeFile)?.content || '';
+          const blob = new Blob([code], { type: 'text/html' }); const url = URL.createObjectURL(blob); window.open(url,'_blank'); setTimeout(()=>URL.revokeObjectURL(url),5000);
+        } }, ['🔗 Open']),
+        el('button', { class: 'neu-btn', onClick: () => {
+          const iframe = rightRoot.querySelector('iframe'); const code = State.get().files.find(f => f.name === State.get().activeFile)?.content || '';
+          if (iframe) iframe.srcdoc = code;
+        } }, ['▶ Run']),
+      ])
+    ]);
+    rightRoot.appendChild(header);
+
+    const iframeWrap = el('div', { style: 'height:520px;background:white;margin:8px;border:1px solid var(--border-color)' });
+    const iframe = el('iframe', { sandbox: 'allow-scripts allow-forms allow-modals allow-popups', title: 'App Preview', style: 'width:100%;height:100%;border:0' });
+    iframeWrap.appendChild(iframe);
+    rightRoot.appendChild(iframeWrap);
+    const details = el('div', { style: 'padding:8px;border-top:1px solid var(--border-color)' });
+    rightRoot.appendChild(details);
+  }
+
+  // ---------- Keyboard Shortcuts & Accessibility ----------
+  window.addEventListener('keydown', async (e) => {
+    // Ctrl/Cmd+S save to DB
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 's') {
+      e.preventDefault(); await saveActiveFileAsApp();
       return;
     }
-    // If puter and signed in we could use puter, else use Pollinations or fallback
-    state.generating = true;
-    updateUI();
-    addLog(`Model: ${state.settings.model || "default"}`);
-    addLog("Generating code...");
-
-    let systemPrompt = `You are an expert web developer. Create a COMPLETE single HTML file app.
-RULES:
-- Start with <!DOCTYPE html>
-- ALL CSS in <style> tag, ALL JS in <script> tag
-- Modern CSS: variables, flexbox/grid, animations, gradients
-- Modern JS: ES6+, localStorage, event handling
-- Responsive and polished UI
-- NO external dependencies
-- Return ONLY HTML code`;
-    let userPrompt = `Build: ${finalPrompt}`;
-    let code = "";
-
-    try {
-      if (window.puter && state.settings.activeProvider === "Puter") {
-        try {
-          // attempt non-streaming API
-          const resp = await window.puter.ai.chat([{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }], { model: state.settings.model || undefined, stream: false });
-          // resp may be string or object with choices
-          if (typeof resp === "string") code = resp;
-          else code = resp?.choices?.[0]?.message?.content || resp?.content || JSON.stringify(resp);
-        } catch (err) {
-          addLog("Puter AI error, falling back to Pollinations / local fallback");
-        }
-      }
-
-      if (!code && state.settings.activeProvider === "Pollinations") {
-        const pollKey = state.settings.apiKeys?.Pollinations;
-        const url = `https://gen.pollinations.ai/text/${encodeURIComponent(systemPrompt + "\n\n" + userPrompt)}?model=${encodeURIComponent(state.settings.model || "")}&json=true`;
-        const res = await fetch(url, { method: "GET", headers: { Authorization: pollKey ? `Bearer ${pollKey}` : "" } });
-        if (!res.ok) throw new Error(`Pollinations API Error: ${res.status}`);
-        const text = await res.text();
-        try {
-          const data = JSON.parse(text);
-          code = data?.choices?.[0]?.message?.content || data?.content || String(data);
-        } catch {
-          code = text;
-        }
-      }
-
-      // Fallback simple template if no provider worked
-      if (!code) {
-        code = `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${(inputAppTitle.value || "My App")}</title>
-<style>
-  body{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh}
-  .card{padding:20px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.08)}
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>${(inputAppTitle.value || "My App")}</h1>
-    <p>${finalPrompt}</p>
-  </div>
-</body>
-</html>`;
-      }
-
-      // sanitize code blocks
-      code = code.replace(/```html?\n?/gi, "").replace(/```\n?/g, "").trim();
-      const start = code.search(/<!doctype\s+html>/i);
-      if (start > 0) code = code.slice(start);
-      if (!code.toLowerCase().includes("<!doctype html>")) {
-        // still allow but warn; append a wrapper
-        addLog("⚠️ Generated content lacked <!doctype html>; wrapping in a minimal HTML");
-        code = `<!doctype html><html><body><pre>${escapeHtml(code)}</pre></body></html>`;
-      }
-
-      addLog(`Generated ${code.length} bytes`);
-
-      // Save files to local "hosting" (if puter present try to write and host)
-      let hostedUrl = null;
-      let previewBlobUrl = null;
-      try {
-        if (window.puter) {
-          // attempt to create a dir and hosting as original flow
-          const dirName = `app_${Date.now()}`;
-          try {
-            if (window.puter.fs && window.puter.fs.mkdir) await window.puter.fs.mkdir(dirName);
-            if (window.puter.fs && window.puter.fs.write) await window.puter.fs.write(`${dirName}/index.html`, code);
-            // try hosting creation - best-effort
-            try {
-              const site = await window.puter.hosting.create(inputAppName.value || undefined, dirName);
-              hostedUrl = `https://${site.subdomain}.puter.site`;
-              addLog(`Hosted at: ${hostedUrl}`);
-            } catch (err) {
-              addLog("Puter hosting failed; falling back to blob preview");
-            }
-          } catch (err) {
-            addLog("Puter fs error; fallback to blob preview");
-          }
-        }
-
-        if (!hostedUrl) {
-          // create a blob URL for preview and hosting fallback
-          const blob = new Blob([code], { type: "text/html" });
-          previewBlobUrl = URL.createObjectURL(blob);
-          addLog("Created preview blob URL");
-        }
-      } catch (err) {
-        addLog("Hosting/FS step failed: " + err.message);
-      }
-
-      // Save app doc into local DB
-      const appDoc = {
-        _id: uid("app_"),
-        type: "app",
-        prompt: finalPrompt,
-        code,
-        appName: inputAppName.value.trim() || `app_${Date.now()}`,
-        appTitle: inputAppTitle.value.trim() || finalPrompt.slice(0, 50),
-        model: state.settings.model || "",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        version: 1,
-        views: 0,
-        hostedUrl: hostedUrl,
-        previewBlobUrl: previewBlobUrl,
-        favorite: false,
-      };
-      state.apps.unshift(appDoc);
-      saveJSON(DB_APPS, state.apps);
-
-      // Save version
-      addVersion({ _id: uid("ver_"), type: "version", appId: appDoc._id, code, version: 1, createdAt: Date.now(), note: "Initial version" });
-
-      state.selectedAppId = appDoc._id;
-      state.editCode = "";
-      state.files = [{ name: "index.html", content: code }];
-      state.activeFile = "index.html";
-      addLog("✅ Complete!");
-      updateUI();
-      // open hosted url if exists else open blob preview
-      window.open(hostedUrl || previewBlobUrl, "_blank");
-    } catch (err) {
-      addLog(`❌ Error: ${err.message}`);
-    } finally {
-      state.generating = false;
-      updateUI();
+    // Ctrl/Cmd+Enter run
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      const iframe = rightRoot.querySelector('iframe');
+      const code = State.get().files.find(f => f.name === State.get().activeFile)?.content || '';
+      if (iframe) iframe.srcdoc = code;
+      addLog('Run (Ctrl+Enter)');
+      return;
     }
-  }
-
-  function escapeHtml(str) {
-    return str.replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
-  }
-
-  async function updateAndRedeploy() {
-    const sel = getSelectedApp();
-    if (!sel) return;
-    const newCode = editorArea.value;
-    if (!newCode) return;
-    addLog("Updating...");
-    // create version record
-    const newVersion = (sel.version || 1) + 1;
-    sel.code = newCode;
-    sel.version = newVersion;
-    sel.updatedAt = Date.now();
-    // create preview blob
-    const blob = new Blob([newCode], { type: "text/html" });
-    sel.previewBlobUrl = URL.createObjectURL(blob);
-    putApp(sel);
-    addVersion({ _id: uid("ver_"), type: "version", appId: sel._id, code: newCode, version: newVersion, createdAt: Date.now(), note: `Version ${newVersion}` });
-    state.apps = getApps();
-    addLog(`✅ Updated to v${newVersion}`);
-    updateUI();
-    window.open(sel.hostedUrl || sel.previewBlobUrl, "_blank");
-  }
-
-  // ---------- Misc helpers ----------
-  function copyCode() {
-    const code = editorArea.value || "";
-    navigator.clipboard.writeText(code);
-    addLog("✅ Copied code to clipboard");
-  }
-  function formatCode() {
-    // basic prettify: just indent HTML (very naive) - recommend integrating prettier later
-    try {
-      const formatted = (editorArea.value || "").replace(/>\s+</g, ">\n<");
-      editorArea.value = formatted;
-      state.editCode = formatted;
-      addLog("Formatted code (basic)");
-      renderEditorCharCount();
-      renderPreview();
-    } catch (err) {
-      addLog("Format failed");
+    // Ctrl/Cmd+N new file
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'n') {
+      e.preventDefault();
+      const nm = prompt('New file name');
+      if (!nm) return;
+      if (State.get().files.some(f => f.name.toLowerCase() === nm.toLowerCase())) { addLog('File exists'); return; }
+      State.addFile({ name: nm, content: '' });
+      if (editor) editor.setValue('');
+      renderFileTabs();
+      addLog(`Created file ${nm}`);
+      return;
     }
-  }
-  function runPreview() {
-    const iframe = qs("#previewIframe");
-    const code = editorArea.value || getSelectedApp()?.code || "";
-    if (!iframe) return;
-    iframe.srcdoc = code;
-    addLog("Ran preview");
-  }
-  function openInNewTab() {
-    const sel = getSelectedApp();
-    if (!sel) return;
-    window.open(sel.hostedUrl || sel.previewBlobUrl || "about:blank", "_blank");
-  }
-  function exportCurrentApp() {
-    const sel = getSelectedApp();
-    if (!sel) return;
-    const data = JSON.stringify(sel, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${sel.appName || "app"}-export.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    addLog(`✅ Exported ${sel.appName || sel._id}`);
-  }
-
-  // ---------- Settings toggles and simple UI helpers ----------
-  let filterFavorites = false;
-  function toggleFilterFavorites() {
-    filterFavorites = !filterFavorites;
-    // simple filter applied in rerenderAppsList by filtering state.apps
-    // For brevity, we just show a log and leave list unaffected in this lightweight port
-    addLog(filterFavorites ? "Filtering favorites" : "Showing all apps");
-  }
-  function setSortBy(val) {
-    addLog(`Sort set to ${val}`);
-  }
-  function toggleBulkMode() {
-    addLog("Bulk mode toggle (not fully implemented)");
-  }
-  function resetBuild() {
-    state.selectedAppId = null;
-    state.editCode = "";
-    state.files = [{ name: "index.html", content: "" }];
-    state.activeFile = "index.html";
-    promptArea.value = "";
-    inputAppName.value = "";
-    inputAppTitle.value = "";
-    updateUI();
-  }
-
-  // ---------- SDK / model loading on mount ----------
-  async function init() {
-    // Load Puter SDK script if not present
-    if (!window.puter) {
-      const s = document.createElement("script");
-      s.src = "https://js.puter.com/v2/";
-      s.onload = async () => {
-        state.puter = window.puter;
-        addLog("Puter SDK ready");
-        try {
-          if (window.puter.auth && window.puter.auth.isSignedIn()) {
-            state.user = await window.puter.auth.getUser();
-            addLog(`Welcome ${state.user.username}`);
-          }
-        } catch (err) {
-          // ignore
-        }
-      };
-      document.body.appendChild(s);
-    } else {
-      state.puter = window.puter;
-      try {
-        if (window.puter.auth && window.puter.auth.isSignedIn()) {
-          state.user = await window.puter.auth.getUser();
-          addLog(`Welcome ${state.user.username}`);
-        }
-      } catch {}
+    // Ctrl+Shift+S export all
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      const apps = await DB.allApps();
+      const blob = new Blob([JSON.stringify(apps, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = el('a', { href: url, download: `aijr-apps-export-${Date.now()}.json` });
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      addLog('Exported apps (Ctrl+Shift+S)');
+      return;
     }
-
-    // Fetch Puter models list (best-effort)
-    try {
-      const res = await fetch("https://api.puter.com/puterai/chat/models/");
-      const data = await res.json();
-      const list = (Array.isArray(data) ? data : data.models || []).map(m => {
-        const id = typeof m === "string" ? m : m.id;
-        return { id, provider: "OpenAI-like" };
-      });
-      state.models = list;
-    } catch (err) {
-      // ignore
-    }
-
-    // load persisted apps & versions into state
-    state.apps = getApps();
-    state.versions = getVersions();
-
-    // apply theme
-    document.body.className = `theme-${state.settings.appTheme || "light"}`;
-
-    // initial UI render
-    updateUI();
-  }
-
-  // ---------- simple analytics / usage fetch ----------
-  async function fetchUsage() {
-    if (!window.puter || !window.puter.auth || !window.puter.auth.getMonthlyUsage) return;
-    try {
-      const usage = await window.puter.auth.getMonthlyUsage();
-      usageContainer.innerHTML = `${(usage.allowanceInfo?.monthUsageAllowance/1e6 || "0")}M used`;
-    } catch {}
-  }
-
-  // ---------- small UI toggles ----------
-  function openShareModalForApp(app) {
-    // wrapper if needed
-  }
-
-  function toggleAnalytics() {
-    addLog("Toggle analytics (simple port)");
-  }
-
-  // ---------- Helpers for addVersion into state and storage ----------
-  function addVersion(v) {
-    state.versions.unshift(v);
-    saveJSON(DB_VERSIONS, state.versions);
-  }
-
-  // ---------- Wire up simple UI events ----------
-  qs("#createBtn").addEventListener("click", () => buildAndDeploy());
-  modelSelect.addEventListener("change", (e) => { state.settings.model = e.target.value; saveSettings(state.settings); });
-  qs("#appsSearchInput").addEventListener("input", (e) => {
-    const q = e.target.value.trim().toLowerCase();
-    // simple client-side filter
-    appsListWrap.innerHTML = "";
-    for (const app of state.apps.filter(a => !q || (a.appName||"").toLowerCase().includes(q) || (a.appTitle||"").toLowerCase().includes(q) || (a.prompt||"").toLowerCase().includes(q))) {
-      const appEl = el("div", {
-        class: "p-4 border-b cursor-pointer",
-        onclick: () => selectApp(app._id)
-      },
-        el("div", { class: "font-black" }, `${app.appTitle || app.appName} ${app.favorite ? "⭐" : ""}`),
-        el("div", { class: "text-xs text-[#666]" }, `v${app.version || 1} • 👁️ ${app.views || 0}`),
-        el("div", { class: "text-xs text-[#666] truncate" }, app.prompt || "")
-      );
-      appsListWrap.appendChild(appEl);
+    // Ctrl+Shift+Z show undo snapshots modal (from autosave)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      openAutosaveSnapshotsModal();
+      return;
     }
   });
 
-  // ---------- Init ----------
-  init();
+  // ---------- Autosave snapshots modal (view & restore) ----------
+  function openAutosaveSnapshotsModal() {
+    const key = 'va_autosave_versions';
+    const map = JSON.parse(localStorage.getItem(key) || '{}');
+    const fileName = State.get().activeFile;
+    const list = map[fileName] || [];
+    const container = el('div', {});
+    container.appendChild(el('h3', {}, [`Autosave snapshots — ${fileName}`]));
+    if (list.length === 0) container.appendChild(el('div', {}, ['No snapshots']));
+    else {
+      list.forEach((s, idx) => {
+        const row = el('div', { class: 'neu-inset', style: 'padding:8px;display:flex;justify-content:space-between;align-items:center;margin-top:6px' }, [
+          el('div', {}, [el('div', { style: 'font-size:12px;color:var(--text-secondary)' }, [new Date(s.createdAt).toLocaleString()]), el('pre', { style: 'max-height:120px;overflow:auto' }, [s.content.slice(0,200)])]),
+          el('div', {}, [ el('button', { class: 'neu-btn' }, ['Restore']) ])
+        ]);
+        row.querySelector('button').addEventListener('click', () => {
+          if (editor) editor.setValue(s.content);
+          addLog('Restored autosave snapshot');
+          modal.close();
+        });
+        container.appendChild(row);
+      });
+    }
+    const modal = openModal(container);
+  }
 
-  // Expose some things for debugging
-  window.JRApp = {
-    state,
-    addLog,
-    buildAndDeploy,
-    updateAndRedeploy,
-    getApps,
-    saveSettings,
+  // ---------- Initialization ----------
+  renderLeft();
+  renderRight();
+  initEditor();
+
+  // Wire new file button
+  if (newFileBtn) newFileBtn.addEventListener('click', () => {
+    const name = prompt('New file name (e.g., index.html)');
+    if (!name) return;
+    if (State.get().files.some(f => f.name.toLowerCase() === name.toLowerCase())) { addLog('File exists'); return; }
+    State.addFile({ name, content: '' });
+    if (editor) editor.setValue('');
+    renderFileTabs();
+  });
+
+  // wire settings icon if present
+  document.querySelectorAll('[title="Settings"]').forEach(btn => btn.addEventListener('click', openSettingsModal));
+
+  // Expose API for debugging
+  window.__AIJR = {
+    State, DB, formatHtml, formatCss: (s)=>formatCodeByType(s,'.css'), formatJs,
+    buildAndDeploy: async (p)=>{ await buildAndDeploy(p); }, openExportImportModal,
+    openAutosaveSnapshotsModal,
   };
-})();
+
+  // Load apps into state and start periodic refresh
+  (async () => {
+    const apps = await DB.allApps();
+    State.set({ apps });
+    addLog(`Loaded ${apps.length || 0} apps (${DB.usingFireproof() ? 'Fireproof' : 'localStorage'})`);
+  })();
+
+  setInterval(async () => {
+    const apps = await DB.allApps();
+    State.set({ apps });
+    await refreshUsage();
+  }, 30_000);
+
+  // make sure UI components reflect state
+  State.subscribe(() => {
+    renderFileTabs();
+    // logs
+    const logPanel = leftRoot.querySelector('.log-panel');
+    if (logPanel) {
+      logPanel.innerHTML = '';
+      (State.get().logs || []).forEach(l => logPanel.appendChild(el('div', {}, [l])));
+    } else {
+      // create log panel
+      const lp = el('div', { class: 'log-panel neu-inset', style: 'margin-top:12px;padding:8px;max-height:160px;overflow:auto' });
+      (State.get().logs || []).forEach(l => lp.appendChild(el('div', {}, [l])));
+      leftRoot.appendChild(lp);
+    }
+  });
+
+  // final log
+  addLog('App initialized — feature-complete vanilla JS');
+}
